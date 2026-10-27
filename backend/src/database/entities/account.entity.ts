@@ -28,10 +28,13 @@ export class Account {
   account_number: string;
 
   @Column({ type: 'numeric', precision: 18, scale: 2, default: 0 })
-  balance: string; // TypeORM maps numeric to string in TypeScript
+  balance: string;
 
   @Column({ type: 'varchar', length: 10, default: 'VND' })
   currency: string;
+
+  @Column({ type: 'int', default: 0 })
+  version: number;
 
   @CreateDateColumn({ type: 'timestamptz' })
   created_at: Date;

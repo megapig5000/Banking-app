@@ -5,9 +5,10 @@ import { Account } from './entities/account.entity';
 import { Transaction } from './entities/transaction.entity';
 import { Baseline1710000000000 } from './migrations/1710000000000-Baseline';
 import { AddDepositWithdrawAndIdempotencyScope1710000001000 } from './migrations/1710000001000-AddDepositWithdrawAndIdempotencyScope';
+import { AddAccountVersionColumn1710000002000 } from './migrations/1710000002000-AddAccountVersionColumn';
 
 const isTest = process.env.NODE_ENV === 'test';
-dotenv.config({ path: isTest ? '.env.test' : '.env', quiet: true });
+dotenv.config({ path: isTest ? '.env.test' : '.env' });
 
 if (isTest && !process.env.JWT_SECRET) {
   process.env.JWT_SECRET = 'test_secret_jwt_key_for_e2e';
@@ -25,6 +26,7 @@ export const dataSourceOptions: DataSourceOptions = {
   migrations: [
     Baseline1710000000000,
     AddDepositWithdrawAndIdempotencyScope1710000001000,
+    AddAccountVersionColumn1710000002000,
   ],
   synchronize: false,
 };

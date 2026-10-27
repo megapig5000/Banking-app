@@ -29,11 +29,11 @@ import {
   getVietnamNextDayStart,
 } from '../common/utils/date.util';
 import {
-  LOCK_TIMEOUT,
-  PG_LOCK_NOT_AVAILABLE,
+  MAX_OPTIMISTIC_RETRIES,
   PG_NUMERIC_OVERFLOW,
-  PG_QUERY_CANCELED,
   PG_UNIQUE_VIOLATION,
+  RETRY_DELAY_MAX_MS,
+  RETRY_DELAY_MIN_MS,
 } from './transactions.constants';
 
 interface ExpectedIdempotencyPayload {
@@ -41,6 +41,12 @@ interface ExpectedIdempotencyPayload {
   amount: string;
   description: string | null;
   toAccountNumber: string | null;
+}
+
+class OptimisticLockConflictError extends Error {
+  constructor() {
+    super('Optimistic lock version conflict');
+  }
 }
 
 @Injectable()
@@ -71,7 +77,9 @@ export class TransactionsService {
       where: { user_id: userId },
     });
     if (!account) {
-      throw new NotFoundException('Không tìm thấy tài khoản ngân hàng của bạn');
+      throw new NotFoundException(
+        'Không tìm thấy tài khoản ngân hàng của bạn',
+      );
     }
     const accountId = account.id;
 
@@ -138,80 +146,95 @@ export class TransactionsService {
       toAccountNumber: dto.toAccountNumber,
     };
 
-    const queryRunner = await this.startTransactionWithLockTimeout();
-    let actorAccountId: string | null = null;
+    return this.executeWithOptimisticRetry(async () => {
+      const queryRunner = await this.startNewTransaction();
+      let actorAccountId: string | null = null;
 
-    try {
-      // 1. Tải và khóa dòng (SELECT ... FOR UPDATE) cả tài khoản nguồn & đích theo id ASC
-      const { actorAccount, destAccount } =
-        await this.loadAccountsForTransaction(
+      try {
+        // 1. Đọc tài khoản KHÔNG khóa (Optimistic)
+        const { actorAccount, destAccount } =
+          await this.loadAccountsForTransaction(
+            queryRunner.manager,
+            userId,
+            dto.toAccountNumber,
+          );
+        this.validateActorAccount(actorAccount);
+        actorAccountId = actorAccount.id;
+
+        // 2. Kiểm tra Idempotency-Key
+        const existingTx = await this.findExistingByIdempotencyKey(
           queryRunner.manager,
-          userId,
-          dto.toAccountNumber,
-        );
-      this.validateActorAccount(actorAccount);
-      actorAccountId = actorAccount.id;
-
-      // 2. Kiểm tra Idempotency-Key sau khi đã giữ khóa trên tài khoản thực hiện
-      const existingTx = await this.findExistingByIdempotencyKey(
-        queryRunner.manager,
-        actorAccountId,
-        idempotencyKey,
-      );
-      if (existingTx) {
-        await queryRunner.rollbackTransaction();
-        return this.resolveIdempotencyReplay(
-          existingTx,
           actorAccountId,
+          idempotencyKey,
+        );
+        if (existingTx) {
+          await queryRunner.rollbackTransaction();
+          return this.resolveIdempotencyReplay(
+            existingTx,
+            actorAccountId,
+            expectedPayload,
+          );
+        }
+
+        // 3. Kiểm tra tài khoản đích & số dư đã đọc
+        const validDest = this.validateDestinationAccount(
+          destAccount,
+          actorAccount,
+        );
+        this.ensureSufficientBalance(actorAccount.balance, dto.amount);
+
+        // 4. Trừ tiền kèm kiểm tra version của tài khoản nguồn
+        await this.debitAccountOptimistic(
+          queryRunner.manager,
+          actorAccount.id,
+          actorAccount.version,
+          dto.amount,
+        );
+
+        // 5. Cộng tiền kèm kiểm tra version của tài khoản đích
+        await this.creditAccountOptimistic(
+          queryRunner.manager,
+          validDest.id,
+          validDest.version,
+          dto.amount,
+        );
+
+        // 6. Ghi bản ghi giao dịch
+        const savedTx = await this.insertTransactionRecord(
+          queryRunner.manager,
+          {
+            actorAccountId: actorAccount.id,
+            fromAccountId: actorAccount.id,
+            toAccountId: validDest.id,
+            amount: dto.amount,
+            type: TransactionType.TRANSFER,
+            description: sanitizedDesc,
+            idempotencyKey,
+          },
+        );
+
+        await queryRunner.commitTransaction();
+
+        return {
+          isReplay: false,
+          transaction: this.mapTransactionResponse(
+            savedTx,
+            'outgoing',
+            validDest.account_number,
+          ),
+        };
+      } catch (error: any) {
+        return await this.handleTransactionError(
+          queryRunner,
+          error,
+          actorAccountId,
+          idempotencyKey,
           expectedPayload,
         );
+      } finally {
+        await queryRunner.release();
       }
-
-      // 3. Kiểm tra tài khoản đích và kiểm tra số dư từ dữ liệu vừa đọc sau khi khóa
-      const validDest = this.validateDestinationAccount(
-        destAccount,
-        actorAccount,
-      );
-      this.ensureSufficientLockedBalance(actorAccount.balance, dto.amount);
-
-      // 4. Trừ tiền tài khoản nguồn (giữ điều kiện WHERE balance >= :amount làm dây an toàn thứ 2)
-      await this.debitAccount(queryRunner.manager, actorAccount.id, dto.amount);
-
-      // 5. Cộng tiền tài khoản đích
-      await this.creditAccount(queryRunner.manager, validDest.id, dto.amount);
-
-      // 6. Ghi bản ghi giao dịch
-      const savedTx = await this.insertTransactionRecord(queryRunner.manager, {
-        actorAccountId: actorAccount.id,
-        fromAccountId: actorAccount.id,
-        toAccountId: validDest.id,
-        amount: dto.amount,
-        type: TransactionType.TRANSFER,
-        description: sanitizedDesc,
-        idempotencyKey,
-      });
-
-      await queryRunner.commitTransaction();
-
-      return {
-        isReplay: false,
-        transaction: this.mapTransactionResponse(
-          savedTx,
-          'outgoing',
-          validDest.account_number,
-        ),
-      };
-    } catch (error: any) {
-      return await this.handleTransactionError(
-        queryRunner,
-        error,
-        actorAccountId,
-        idempotencyKey,
-        expectedPayload,
-      );
-    } finally {
-      await queryRunner.release();
-    }
+    });
   }
 
   async deposit(
@@ -228,68 +251,70 @@ export class TransactionsService {
       toAccountNumber: null,
     };
 
-    const queryRunner = await this.startTransactionWithLockTimeout();
-    let actorAccountId: string | null = null;
+    return this.executeWithOptimisticRetry(async () => {
+      const queryRunner = await this.startNewTransaction();
+      let actorAccountId: string | null = null;
 
-    try {
-      // 1. Tải và khóa dòng tài khoản bằng SELECT ... FOR UPDATE
-      const { actorAccount } = await this.loadAccountsForTransaction(
-        queryRunner.manager,
-        userId,
-      );
-      this.validateActorAccount(actorAccount);
-      actorAccountId = actorAccount.id;
+      try {
+        const { actorAccount } = await this.loadAccountsForTransaction(
+          queryRunner.manager,
+          userId,
+        );
+        this.validateActorAccount(actorAccount);
+        actorAccountId = actorAccount.id;
 
-      // 2. Kiểm tra Idempotency-Key
-      const existingTx = await this.findExistingByIdempotencyKey(
-        queryRunner.manager,
-        actorAccountId,
-        idempotencyKey,
-      );
-      if (existingTx) {
-        await queryRunner.rollbackTransaction();
-        return this.resolveIdempotencyReplay(
-          existingTx,
+        const existingTx = await this.findExistingByIdempotencyKey(
+          queryRunner.manager,
           actorAccountId,
+          idempotencyKey,
+        );
+        if (existingTx) {
+          await queryRunner.rollbackTransaction();
+          return this.resolveIdempotencyReplay(
+            existingTx,
+            actorAccountId,
+            expectedPayload,
+          );
+        }
+
+        await this.creditAccountOptimistic(
+          queryRunner.manager,
+          actorAccount.id,
+          actorAccount.version,
+          dto.amount,
+        );
+
+        const savedTx = await this.insertTransactionRecord(
+          queryRunner.manager,
+          {
+            actorAccountId: actorAccount.id,
+            fromAccountId: null,
+            toAccountId: actorAccount.id,
+            amount: dto.amount,
+            type: TransactionType.DEPOSIT,
+            description: sanitizedDesc,
+            idempotencyKey,
+          },
+        );
+
+        await queryRunner.commitTransaction();
+
+        return {
+          isReplay: false,
+          transaction: this.mapTransactionResponse(savedTx, 'incoming', null),
+        };
+      } catch (error: any) {
+        return await this.handleTransactionError(
+          queryRunner,
+          error,
+          actorAccountId,
+          idempotencyKey,
           expectedPayload,
         );
+      } finally {
+        await queryRunner.release();
       }
-
-      // 3. Cộng tiền vào tài khoản
-      await this.creditAccount(
-        queryRunner.manager,
-        actorAccount.id,
-        dto.amount,
-      );
-
-      // 4. Ghi bản ghi giao dịch
-      const savedTx = await this.insertTransactionRecord(queryRunner.manager, {
-        actorAccountId: actorAccount.id,
-        fromAccountId: null,
-        toAccountId: actorAccount.id,
-        amount: dto.amount,
-        type: TransactionType.DEPOSIT,
-        description: sanitizedDesc,
-        idempotencyKey,
-      });
-
-      await queryRunner.commitTransaction();
-
-      return {
-        isReplay: false,
-        transaction: this.mapTransactionResponse(savedTx, 'incoming', null),
-      };
-    } catch (error: any) {
-      return await this.handleTransactionError(
-        queryRunner,
-        error,
-        actorAccountId,
-        idempotencyKey,
-        expectedPayload,
-      );
-    } finally {
-      await queryRunner.release();
-    }
+    });
   }
 
   async withdraw(
@@ -306,82 +331,120 @@ export class TransactionsService {
       toAccountNumber: null,
     };
 
-    const queryRunner = await this.startTransactionWithLockTimeout();
-    let actorAccountId: string | null = null;
+    return this.executeWithOptimisticRetry(async () => {
+      const queryRunner = await this.startNewTransaction();
+      let actorAccountId: string | null = null;
 
-    try {
-      // 1. Tải và khóa dòng tài khoản bằng SELECT ... FOR UPDATE
-      const { actorAccount } = await this.loadAccountsForTransaction(
-        queryRunner.manager,
-        userId,
-      );
-      this.validateActorAccount(actorAccount);
-      actorAccountId = actorAccount.id;
+      try {
+        // 1. Đọc tài khoản KHÔNG khóa (lấy cả balance và version hiện tại)
+        const { actorAccount } = await this.loadAccountsForTransaction(
+          queryRunner.manager,
+          userId,
+        );
+        this.validateActorAccount(actorAccount);
+        actorAccountId = actorAccount.id;
 
-      // 2. Kiểm tra Idempotency-Key
-      const existingTx = await this.findExistingByIdempotencyKey(
-        queryRunner.manager,
-        actorAccountId,
-        idempotencyKey,
-      );
-      if (existingTx) {
-        await queryRunner.rollbackTransaction();
-        return this.resolveIdempotencyReplay(
-          existingTx,
+        // 2. Kiểm tra Idempotency-Key
+        const existingTx = await this.findExistingByIdempotencyKey(
+          queryRunner.manager,
           actorAccountId,
+          idempotencyKey,
+        );
+        if (existingTx) {
+          await queryRunner.rollbackTransaction();
+          return this.resolveIdempotencyReplay(
+            existingTx,
+            actorAccountId,
+            expectedPayload,
+          );
+        }
+
+        // 3. Kiểm tra số dư từ dữ liệu vừa đọc
+        this.ensureSufficientBalance(actorAccount.balance, dto.amount);
+
+        // 4. Trừ tiền kèm điều kiện WHERE version = :expectedVersion
+        await this.debitAccountOptimistic(
+          queryRunner.manager,
+          actorAccount.id,
+          actorAccount.version,
+          dto.amount,
+        );
+
+        // 5. Ghi bản ghi giao dịch
+        const savedTx = await this.insertTransactionRecord(
+          queryRunner.manager,
+          {
+            actorAccountId: actorAccount.id,
+            fromAccountId: actorAccount.id,
+            toAccountId: null,
+            amount: dto.amount,
+            type: TransactionType.WITHDRAW,
+            description: sanitizedDesc,
+            idempotencyKey,
+          },
+        );
+
+        await queryRunner.commitTransaction();
+
+        return {
+          isReplay: false,
+          transaction: this.mapTransactionResponse(savedTx, 'outgoing', null),
+        };
+      } catch (error: any) {
+        return await this.handleTransactionError(
+          queryRunner,
+          error,
+          actorAccountId,
+          idempotencyKey,
           expectedPayload,
         );
+      } finally {
+        await queryRunner.release();
       }
-
-      // 3. Kiểm tra số dư ngay trên dữ liệu vừa đọc sau khi khóa
-      this.ensureSufficientLockedBalance(actorAccount.balance, dto.amount);
-
-      // 4. Trừ tiền (kèm điều kiện WHERE balance >= :amount làm dây an toàn thứ 2)
-      await this.debitAccount(queryRunner.manager, actorAccount.id, dto.amount);
-
-      // 5. Ghi bản ghi giao dịch
-      const savedTx = await this.insertTransactionRecord(queryRunner.manager, {
-        actorAccountId: actorAccount.id,
-        fromAccountId: actorAccount.id,
-        toAccountId: null,
-        amount: dto.amount,
-        type: TransactionType.WITHDRAW,
-        description: sanitizedDesc,
-        idempotencyKey,
-      });
-
-      await queryRunner.commitTransaction();
-
-      return {
-        isReplay: false,
-        transaction: this.mapTransactionResponse(savedTx, 'outgoing', null),
-      };
-    } catch (error: any) {
-      return await this.handleTransactionError(
-        queryRunner,
-        error,
-        actorAccountId,
-        idempotencyKey,
-        expectedPayload,
-      );
-    } finally {
-      await queryRunner.release();
-    }
+    });
   }
 
   // =========================================================================
-  // CÁC BƯỚC DÙNG CHUNG TRONG LUỒNG GIAO DỊCH
+  // VÒNG LẶP RETRY BAO NGOÀI TRANSACTION CHO OPTIMISTIC LOCKING
   // =========================================================================
 
   /**
-   * Mở Database Transaction và đặt SET LOCAL lock_timeout bên trong transaction
-   * để tránh hiện tượng các request chờ khóa bị treo vô hạn.
+   * Mỗi lần gặp xung đột version, transaction cũ đã được rollback và đóng lại;
+   * hàm này chờ một khoảng ngắn ngẫu nhiên rồi chạy lại toàn bộ hàm operation
+   * trong một Database Transaction hoàn toàn mới.
    */
-  private async startTransactionWithLockTimeout(): Promise<QueryRunner> {
+  private async executeWithOptimisticRetry<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    for (let attempt = 0; attempt <= MAX_OPTIMISTIC_RETRIES; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        if (error instanceof OptimisticLockConflictError) {
+          if (attempt < MAX_OPTIMISTIC_RETRIES) {
+            const delayMs =
+              Math.floor(
+                Math.random() * (RETRY_DELAY_MAX_MS - RETRY_DELAY_MIN_MS + 1),
+              ) + RETRY_DELAY_MIN_MS;
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+            continue;
+          }
+          throw new ServiceUnavailableException(
+            'Hệ thống đang bận do xung đột giao dịch, vui lòng thử lại',
+          );
+        }
+        throw error;
+      }
+    }
+    throw new ServiceUnavailableException(
+      'Hệ thống đang bận do xung đột giao dịch, vui lòng thử lại',
+    );
+  }
+
+  private async startNewTransaction(): Promise<QueryRunner> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
-    await queryRunner.query(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
     return queryRunner;
   }
 
@@ -391,10 +454,6 @@ export class TransactionsService {
     }
   }
 
-  /**
-   * Chuyển chuỗi số tiền decimal (VD: "100000.50") sang đơn vị xu dạng BigInt (10000050n)
-   * giúp so sánh số tiền chính xác tuyệt đối, không dùng kiểu số thực (float).
-   */
   private parseDecimalToCents(decimalStr: string): bigint {
     const trimmed = decimalStr.trim();
     const isNegative = trimmed.startsWith('-');
@@ -405,15 +464,12 @@ export class TransactionsService {
     return isNegative ? -cents : cents;
   }
 
-  /**
-   * Kiểm tra số dư được đọc SAU KHI đã khóa dòng bằng SELECT ... FOR UPDATE
-   */
-  private ensureSufficientLockedBalance(
-    lockedBalance: string,
+  private ensureSufficientBalance(
+    currentBalance: string,
     requiredAmount: string,
   ): void {
     if (
-      this.parseDecimalToCents(lockedBalance) <
+      this.parseDecimalToCents(currentBalance) <
       this.parseDecimalToCents(requiredAmount)
     ) {
       throw new UnprocessableEntityException('Không đủ số dư khả dụng');
@@ -421,9 +477,7 @@ export class TransactionsService {
   }
 
   /**
-   * Tải và khóa dòng (SELECT ... FOR UPDATE OF "account") cho tất cả account liên quan
-   * trong MỘT truy vấn duy nhất, sắp xếp theo account.id ASC.
-   * Chỉ khóa bảng 'account' (không khóa bảng 'user') để tránh cạm bẫy khóa dư thừa khi JOIN.
+   * Ở nhánh Optimistic: đọc account bằng SELECT thường (KHÔNG có setLock('pessimistic_write'))
    */
   private async loadAccountsForTransaction(
     manager: EntityManager,
@@ -433,7 +487,6 @@ export class TransactionsService {
     const qb = manager
       .createQueryBuilder(Account, 'account')
       .innerJoinAndSelect('account.user', 'user')
-      .setLock('pessimistic_write', undefined, ['account'])
       .where('account.user_id = :userId', { userId });
 
     if (toAccountNumber) {
@@ -476,7 +529,9 @@ export class TransactionsService {
       );
     }
     if (sourceAccount.id === destAccount.id) {
-      throw new BadRequestException('Không thể tự chuyển tiền cho chính mình');
+      throw new BadRequestException(
+        'Không thể tự chuyển tiền cho chính mình',
+      );
     }
     return destAccount;
   }
@@ -521,35 +576,61 @@ export class TransactionsService {
     );
   }
 
-  private async debitAccount(
+  /**
+   * Trừ tiền với Optimistic Lock: kiểm tra WHERE version = :expectedVersion và tăng version + 1.
+   * Nếu affected === 0 -> đã có transaction khác sửa dòng này -> ném OptimisticLockConflictError để retry.
+   */
+  private async debitAccountOptimistic(
     manager: EntityManager,
     accountId: string,
+    expectedVersion: number,
     amount: string,
   ): Promise<void> {
     const debitResult = await manager
       .createQueryBuilder()
       .update(Account)
-      .set({ balance: () => 'balance - :amount' })
-      .where('id = :id AND balance >= :amount', { id: accountId, amount })
+      .set({
+        balance: () => 'balance - :amount',
+        version: () => 'version + 1',
+      })
+      .where('id = :id AND version = :expectedVersion AND balance >= :amount', {
+        id: accountId,
+        expectedVersion,
+        amount,
+      })
       .execute();
 
     if (debitResult.affected === 0) {
-      throw new UnprocessableEntityException('Không đủ số dư khả dụng');
+      throw new OptimisticLockConflictError();
     }
   }
 
-  private async creditAccount(
+  /**
+   * Cộng tiền với Optimistic Lock: kiểm tra WHERE version = :expectedVersion và tăng version + 1.
+   */
+  private async creditAccountOptimistic(
     manager: EntityManager,
     accountId: string,
+    expectedVersion: number,
     amount: string,
   ): Promise<void> {
     try {
-      await manager
+      const creditResult = await manager
         .createQueryBuilder()
         .update(Account)
-        .set({ balance: () => 'balance + :amount' })
-        .where('id = :id', { id: accountId, amount })
+        .set({
+          balance: () => 'balance + :amount',
+          version: () => 'version + 1',
+        })
+        .where('id = :id AND version = :expectedVersion', {
+          id: accountId,
+          expectedVersion,
+        })
         .execute();
+
+      if (creditResult.affected === 0) {
+        throw new OptimisticLockConflictError();
+      }
     } catch (error: any) {
       if (error.code === PG_NUMERIC_OVERFLOW) {
         throw new UnprocessableEntityException(
@@ -597,14 +678,10 @@ export class TransactionsService {
       await queryRunner.rollbackTransaction();
     }
 
-    // Bắt lỗi hết thời gian chờ khóa (55P03: lock_not_available) -> trả 503 thân thiện
-    if (
-      error.code === PG_LOCK_NOT_AVAILABLE ||
-      error.code === PG_QUERY_CANCELED
-    ) {
-      throw new ServiceUnavailableException(
-        'Hệ thống đang bận, vui lòng thử lại',
-      );
+
+    // Nếu là xung đột version -> ném tiếp ra ngoài để executeWithOptimisticRetry thử lại
+    if (error instanceof OptimisticLockConflictError) {
+      throw error;
     }
 
     if (actorAccountId && error.code === PG_UNIQUE_VIOLATION) {
