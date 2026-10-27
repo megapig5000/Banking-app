@@ -625,6 +625,7 @@ export class TransactionsService {
         .where('id = :id AND version = :expectedVersion', {
           id: accountId,
           expectedVersion,
+          amount, // <-- Bắt buộc truyền amount cho biểu thức 'balance + :amount' ở .set()
         })
         .execute();
 
