@@ -1,4 +1,10 @@
-import { Injectable, ConflictException, UnauthorizedException, ForbiddenException, InternalServerErrorException } from '@nestjs/common';
+import {
+  Injectable,
+  ConflictException,
+  UnauthorizedException,
+  ForbiddenException,
+  InternalServerErrorException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { User, UserStatus } from '../database/entities/user.entity';
@@ -21,7 +27,9 @@ export class AuthService {
   async register(registerDto: RegisterDto) {
     const { fullName, email, password } = registerDto;
 
-    const existingUser = await this.userRepository.findOne({ where: { email } });
+    const existingUser = await this.userRepository.findOne({
+      where: { email },
+    });
     if (existingUser) {
       throw new ConflictException('Email đã tồn tại');
     }
@@ -46,16 +54,22 @@ export class AuthService {
       let accountNumber = '';
       let isUnique = false;
       let attempts = 0;
-      
+
       while (!isUnique && attempts < 5) {
-        accountNumber = Math.floor(1000000000 + Math.random() * 9000000000).toString();
-        const existingAcc = await queryRunner.manager.findOne(Account, { where: { account_number: accountNumber } });
+        accountNumber = Math.floor(
+          1000000000 + Math.random() * 9000000000,
+        ).toString();
+        const existingAcc = await queryRunner.manager.findOne(Account, {
+          where: { account_number: accountNumber },
+        });
         if (!existingAcc) isUnique = true;
         attempts++;
       }
 
       if (!isUnique) {
-        throw new InternalServerErrorException('Không thể tạo số tài khoản, vui lòng thử lại');
+        throw new InternalServerErrorException(
+          'Không thể tạo số tài khoản, vui lòng thử lại',
+        );
       }
 
       const account = queryRunner.manager.create(Account, {
@@ -86,7 +100,7 @@ export class AuthService {
 
   async login(loginDto: LoginDto) {
     const { email, password } = loginDto;
-    
+
     const user = await this.userRepository.findOne({ where: { email } });
     if (!user) {
       throw new UnauthorizedException('Email hoặc mật khẩu không đúng');

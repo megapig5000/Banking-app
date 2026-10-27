@@ -39,4 +39,7 @@ async function bootstrap() {
   console.log(`Application is running on: http://localhost:${port}/api`);
   console.log(`Swagger is running on: http://localhost:${port}/api/docs`);
 }
-bootstrap();
+bootstrap().catch((error: unknown) => {
+  console.error('Failed to start application:', error);
+  process.exitCode = 1;
+});

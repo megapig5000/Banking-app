@@ -1,4 +1,10 @@
-import { IsString, IsNotEmpty, Matches, MaxLength, IsOptional } from 'class-validator';
+import {
+  IsString,
+  IsNotEmpty,
+  Matches,
+  MaxLength,
+  IsOptional,
+} from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class TransferDto {
@@ -7,15 +13,22 @@ export class TransferDto {
   @IsNotEmpty()
   toAccountNumber: string;
 
-  @ApiProperty({ example: '50000.00', description: 'Số tiền cần chuyển (dạng string decimal)' })
+  @ApiProperty({
+    example: '50000.00',
+    description: 'Số tiền cần chuyển (dạng string decimal)',
+  })
   @IsString()
   @IsNotEmpty()
   @Matches(/^\d{1,16}(\.\d{1,2})?$/, {
-    message: 'Số tiền không hợp lệ. Phải lớn hơn 0 và tối đa 2 chữ số thập phân.',
+    message:
+      'Số tiền không hợp lệ. Phải lớn hơn 0 và tối đa 2 chữ số thập phân.',
   })
   amount: string;
 
-  @ApiPropertyOptional({ example: 'Chuyen tien mua sach', description: 'Tối đa 200 ký tự' })
+  @ApiPropertyOptional({
+    example: 'Chuyen tien mua sach',
+    description: 'Tối đa 200 ký tự',
+  })
   @IsString()
   @IsOptional()
   @MaxLength(200)

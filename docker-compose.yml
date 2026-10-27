@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:15-alpine
@@ -16,6 +14,24 @@ services:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-root} -d ${DB_NAME:-simple_bank}"]
       interval: 5s
       timeout: 5s
+      retries: 5
+
+  postgres-test:
+    image: postgres:15-alpine
+    container_name: simple_bank_postgres_test
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: ${TEST_DB_USER:-root}
+      POSTGRES_PASSWORD: ${TEST_DB_PASSWORD:-password}
+      POSTGRES_DB: ${TEST_DB_NAME:-simple_bank_test}
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TEST_DB_USER:-root} -d ${TEST_DB_NAME:-simple_bank_test}"]
+      interval: 3s
+      timeout: 3s
       retries: 5
 
   backend:

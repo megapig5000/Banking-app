@@ -11,10 +11,10 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant Bcrypt
 
-    Client->>Controller: POST /auth/login {email, password}
+    Client->>Controller: POST /api/auth/login {email, password}
     Controller->>Service: login(dto)
     Service->>Repo: findOne({email})
-    Repo->>DB: SELECT * FROM users WHERE email = ?
+    Repo->>DB: SELECT * FROM users WHERE email = $1
     DB-->>Repo: User Record
     Repo-->>Service: user entity
     
@@ -31,82 +31,99 @@ sequenceDiagram
             Service-->>Controller: throw ForbiddenException
             Controller-->>Client: 403 Forbidden
         else User is Active
-            Service->>Service: sign JWT(payload: sub)
+            Service->>Service: sign JWT(payload: { sub: user.id })
             Service-->>Controller: { accessToken, user }
             Controller-->>Client: 200 OK + JWT
         end
     end
 ```
 
-## 2. Transfer Flow (Chuyển khoản nội bộ)
+## 2. Transaction Flow (Transfer / Deposit / Withdraw)
+
+> **Ghi chú cho Nạp tiền (`deposit`) và Rút tiền (`withdraw`):**
+> * Cả 3 nghiệp vụ (`transfer`, `deposit`, `withdraw`) đều đi qua cùng một cấu trúc bước xử lý trong `TransactionsService`[cite: 9].
+> * Với `deposit`: chỉ tải `actorAccount` (`to_account_id = actorAccount.id`, `from_account_id = NULL`), bỏ qua bước `debitAccount` và chỉ thực hiện `creditAccount` (kèm bắt lỗi tràn số `22003` → `422`).
+> * Với `withdraw`: chỉ tải `actorAccount` (`from_account_id = actorAccount.id`, `to_account_id = NULL`), chỉ thực hiện `debitAccount` có điều kiện `balance >= :amount` và bỏ qua `creditAccount`[cite: 9].
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Controller as TransactionsController
     participant Service as TransactionsService
-    participant Repo as Repository (TypeORM)
+    participant Manager as EntityManager (QueryRunner)
     participant DB as PostgreSQL
 
-    Client->>Controller: POST /transactions/transfer (Idempotency-Key)
-    Controller->>Controller: Validate JWT & Header
-    Controller->>Service: transfer(userId, idempotencyKey, dto)
-    
-    Service->>Service: Start Database Transaction
-    
-    Service->>Repo: Load Source Account
-    Repo->>DB: SELECT account WHERE user_id = ?
-    DB-->>Repo: sourceAccount
-    Repo-->>Service: sourceAccount
+    Client->>Controller: POST /api/transactions/transfer | deposit | withdraw (Idempotency-Key)
+    Controller->>Controller: Validate JWT, UUID Header & DTO
+    Controller->>Service: transfer / deposit / withdraw(userId, idempotencyKey, dto)
 
-    Service->>Repo: Load Dest Account
-    Repo->>DB: SELECT account WHERE account_number = ?
-    DB-->>Repo: destAccount
-    Repo-->>Service: destAccount
+    Service->>Manager: connect() & startTransaction()
 
-    alt Validation Failed (Not found, Locked, Self-transfer)
-        Service->>Service: Rollback Transaction
-        Service-->>Controller: throw Exception
-        Controller-->>Client: 400 / 404 / 422 Error
-    else Validation Passed
-        Service->>Repo: Debit Source
-        Repo->>DB: UPDATE accounts SET balance = balance - amount WHERE id = ? AND balance >= amount
-        DB-->>Repo: affected rows
-        
-        alt affected == 0 (Insufficient Balance)
-            Repo-->>Service: 0
-            Service->>Service: Rollback Transaction
-            Service-->>Controller: throw UnprocessableEntityException
-            Controller-->>Client: 422 Không đủ số dư
-        else affected == 1
-            Repo-->>Service: 1
-            Service->>Repo: Credit Dest
-            Repo->>DB: UPDATE accounts SET balance = balance + amount WHERE id = ?
-            DB-->>Repo: ok
-            
-            Service->>Repo: Insert Transaction Record
-            Repo->>DB: INSERT INTO transactions (idempotency_key, ...)
-            
-            alt Duplicate Idempotency Key (23505)
-                DB-->>Repo: Unique Violation Error
-                Repo-->>Service: Error
-                Service->>Service: Rollback Transaction
-                Service->>Repo: Find existing transaction
-                Repo->>DB: SELECT * WHERE idempotency_key = ?
-                DB-->>Repo: existingTx
-                Repo-->>Service: existingTx
-                alt Same Payload
-                    Service-->>Controller: { isReplay: true, tx }
-                    Controller-->>Client: 200 OK (Replay)
-                else Different Payload
-                    Service-->>Controller: throw ConflictException
-                    Controller-->>Client: 409 Conflict
+    Service->>Manager: loadAccountsForTransaction(userId, toAccountNumber?)
+    Manager->>DB: SELECT account, user FROM accounts JOIN users ORDER BY account.id ASC
+    DB-->>Manager: accounts[]
+    Manager-->>Service: { actorAccount, destAccount }
+
+    Service->>Manager: findExistingByIdempotencyKey(actorAccount.id, idempotencyKey)
+    Manager->>DB: SELECT * FROM transactions WHERE idempotency_key = $1 AND actor_account_id = $2
+    DB-->>Manager: existingTx | null
+
+    alt Idempotency Key Already Exists
+        Manager-->>Service: existingTx
+        Service->>Manager: rollbackTransaction()
+        alt Same Payload (type, amount, description, toAccountNumber)
+            Service-->>Controller: { isReplay: true, transaction }
+            Controller-->>Client: 200 OK (Replay)
+        else Different Payload or Different Type
+            Service-->>Controller: throw ConflictException
+            Controller-->>Client: 409 Conflict
+        end
+    else New Idempotency Key
+        Manager-->>Service: null
+        Service->>Service: Validate actorAccount & destAccount (active, not self-transfer)
+
+        alt Validation Failed
+            Service->>Manager: rollbackTransaction()
+            Service-->>Controller: throw 400 / 403 / 404 / 422
+            Controller-->>Client: HTTP Error Response
+        else Validation Passed
+            opt Transfer or Withdraw
+                Service->>Manager: debitAccount(actorAccount.id, amount)
+                Manager->>DB: UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance >= $1
+                DB-->>Manager: affected rows
+            end
+
+            alt Debit affected == 0 (Insufficient Balance)
+                Service->>Manager: rollbackTransaction()
+                Service-->>Controller: throw UnprocessableEntityException
+                Controller-->>Client: 422 Không đủ số dư khả dụng
+            else Debit OK (or Deposit)
+                opt Transfer or Deposit
+                    Service->>Manager: creditAccount(targetAccount.id, amount)
+                    Manager->>DB: UPDATE accounts SET balance = balance + $1 WHERE id = $2
+                    DB-->>Manager: ok (or 22003 overflow -> Rollback & 422)
                 end
-            else Insert Success
-                DB-->>Repo: ok
-                Service->>Service: Commit Transaction
-                Service-->>Controller: { isReplay: false, tx }
-                Controller-->>Client: 201 Created
+
+                Service->>Manager: insertTransactionRecord(...)
+                Manager->>DB: INSERT INTO transactions (actor_account_id, idempotency_key, ...)
+
+                alt Concurrent Duplicate Idempotency Key (Error 23505)
+                    DB-->>Manager: Unique Violation 23505
+                    Service->>Manager: rollbackTransaction()
+                    Service->>DB: SELECT existing transaction by (idempotency_key, actor_account_id)
+                    alt Same Payload
+                        Service-->>Controller: { isReplay: true, transaction }
+                        Controller-->>Client: 200 OK (Replay)
+                    else Different Payload
+                        Service-->>Controller: throw ConflictException
+                        Controller-->>Client: 409 Conflict
+                    end
+                else Insert Success
+                    DB-->>Manager: savedTx
+                    Service->>Manager: commitTransaction()
+                    Service-->>Controller: { isReplay: false, transaction }
+                    Controller-->>Client: 201 Created
+                end
             end
         end
     end

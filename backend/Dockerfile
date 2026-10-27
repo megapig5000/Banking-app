@@ -12,9 +12,9 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 # Copy compiled code từ builder
 COPY --from=builder /app/dist ./dist
-# Copy start script
+# Copy start script và chuẩn hóa LF cho môi trường Alpine Linux
 COPY start.sh ./
-RUN chmod +x start.sh
+RUN sed -i 's/\r$//' start.sh && chmod +x start.sh
 
 EXPOSE 3000
 CMD ["./start.sh"]
