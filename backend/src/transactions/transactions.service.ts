@@ -63,7 +63,9 @@ export class TransactionsService {
       where: { user_id: userId },
     });
     if (!account) {
-      throw new NotFoundException('Không tìm thấy tài khoản ngân hàng của bạn');
+      throw new NotFoundException(
+        'Không tìm thấy tài khoản ngân hàng của bạn',
+      );
     }
     const accountId = account.id;
 
@@ -351,19 +353,12 @@ export class TransactionsService {
     }
   }
 
-  // =========================================================================
-  // CÁC BƯỚC DÙNG CHUNG TRONG LUỒNG GIAO DỊCH (HẠNG MỤC C)
-  // =========================================================================
-
   private validatePositiveAmount(amount: string): void {
     if (parseFloat(amount) <= 0) {
       throw new BadRequestException('Số tiền giao dịch phải lớn hơn 0');
     }
   }
 
-  /**
-   * Tải tất cả account liên quan trong MỘT truy vấn duy nhất, sắp xếp theo account.id ASC
-   */
   private async loadAccountsForTransaction(
     manager: EntityManager,
     userId: string,
@@ -414,7 +409,9 @@ export class TransactionsService {
       );
     }
     if (sourceAccount.id === destAccount.id) {
-      throw new BadRequestException('Không thể tự chuyển tiền cho chính mình');
+      throw new BadRequestException(
+        'Không thể tự chuyển tiền cho chính mình',
+      );
     }
     return destAccount;
   }
@@ -444,9 +441,7 @@ export class TransactionsService {
     const isSameDesc =
       (existingTx.description || null) === (expected.description || null);
     const existingToAccNum = existingTx.toAccount?.account_number ?? null;
-    const isSameDest =
-      expected.type !== TransactionType.TRANSFER ||
-      existingToAccNum === expected.toAccountNumber;
+    const isSameDest = existingToAccNum === expected.toAccountNumber;
 
     if (isSameType && isSameAmount && isSameDesc && isSameDest) {
       return {
@@ -460,21 +455,45 @@ export class TransactionsService {
     );
   }
 
+  /**
+   * CẢNH BÁO (EXPERIMENT - KHÔNG MERGE):
+   * Hàm debitAccount phiên bản "ngây thơ" chỉ dùng trên nhánh exp/1.1-race-naive
+   * để chứng minh lỗi Race Condition (Lost Update). Tuyệt đối không dùng ở nhánh chính!
+   */
   private async debitAccount(
     manager: EntityManager,
     accountId: string,
     amount: string,
   ): Promise<void> {
-    const debitResult = await manager
-      .createQueryBuilder()
-      .update(Account)
-      .set({ balance: () => 'balance - :amount' })
-      .where('id = :id AND balance >= :amount', { id: accountId, amount })
-      .execute();
+    // (a) Đọc số dư bằng SELECT thường, không có khóa
+    const account = await manager.findOne(Account, {
+      where: { id: accountId },
+    });
+    if (!account) {
+      throw new NotFoundException('Không tìm thấy tài khoản nguồn');
+    }
 
-    if (debitResult.affected === 0) {
+    const currentBalance = parseFloat(account.balance);
+    const withdrawAmount = parseFloat(amount);
+
+    // (b) Kiểm tra số dư trong code JavaScript
+    if (currentBalance < withdrawAmount) {
       throw new UnprocessableEntityException('Không đủ số dư khả dụng');
     }
+
+    // Khoảng chờ 50ms mô phỏng độ trễ xử lý nghiệp vụ giữa lúc đọc và lúc ghi
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // (c) Tính số dư mới trong code NodeJS
+    const newBalance = (currentBalance - withdrawAmount).toFixed(2);
+
+    // (d) Ghi đè trực tiếp không có điều kiện kiểm tra lại ở WHERE
+    await manager
+      .createQueryBuilder()
+      .update(Account)
+      .set({ balance: newBalance })
+      .where('id = :id', { id: accountId })
+      .execute();
   }
 
   private async creditAccount(
@@ -490,7 +509,6 @@ export class TransactionsService {
         .where('id = :id', { id: accountId, amount })
         .execute();
     } catch (error: any) {
-      // PostgreSQL 22003: numeric_field_overflow (tràn kiểu numeric(18,2))
       if (error.code === '22003') {
         throw new UnprocessableEntityException(
           'Số dư tài khoản vượt quá giới hạn cho phép',
@@ -535,14 +553,11 @@ export class TransactionsService {
     actorAccountId: string | null,
     idempotencyKey: string,
     expectedPayload: ExpectedIdempotencyPayload,
-  ): Promise<{ isReplay: boolean; transaction: any }> {
+  ): Promise<never | { isReplay: boolean; transaction: any }> {
     if (queryRunner.isTransactionActive) {
       await queryRunner.rollbackTransaction();
     }
 
-    // Xử lý xung đột Idempotency khi 2 request cùng key chạy đồng thời:
-    // - Hoặc chạm Unique Violation (23505) lúc INSERT
-    // - Hoặc request 1 vừa commit làm cạn số dư khiến request 2 nhận UnprocessableEntityException (422)
     if (
       actorAccountId &&
       (error.code === '23505' || error instanceof UnprocessableEntityException)
