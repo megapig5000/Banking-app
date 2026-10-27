@@ -74,6 +74,10 @@ export class TransactionsController {
     status: 422,
     description: 'Không đủ số dư hoặc tài khoản đích bị khóa',
   })
+  @ApiResponse({
+    status: 503,
+    description: 'Hệ thống đang bận (quá thời gian chờ khóa tài khoản)',
+  })
   async transfer(
     @Request() req: any,
     @Body() transferDto: TransferDto,
@@ -118,6 +122,10 @@ export class TransactionsController {
     status: 422,
     description: 'Số dư sau khi nạp vượt quá giới hạn numeric(18,2)',
   })
+  @ApiResponse({
+    status: 503,
+    description: 'Hệ thống đang bận (quá thời gian chờ khóa tài khoản)',
+  })
   async deposit(
     @Request() req: any,
     @Body() depositDto: CashTransactionDto,
@@ -161,6 +169,10 @@ export class TransactionsController {
   @ApiResponse({
     status: 422,
     description: 'Không đủ số dư khả dụng',
+  })
+  @ApiResponse({
+    status: 503,
+    description: 'Hệ thống đang bận (quá thời gian chờ khóa tài khoản)',
   })
   async withdraw(
     @Request() req: any,

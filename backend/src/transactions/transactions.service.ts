@@ -6,9 +6,10 @@ import {
   InternalServerErrorException,
   ConflictException,
   ForbiddenException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, Repository } from 'typeorm';
+import { DataSource, EntityManager, QueryRunner, Repository } from 'typeorm';
 import { Account } from '../database/entities/account.entity';
 import {
   Transaction,
@@ -27,6 +28,13 @@ import {
   getVietnamDayStart,
   getVietnamNextDayStart,
 } from '../common/utils/date.util';
+import {
+  LOCK_TIMEOUT,
+  PG_LOCK_NOT_AVAILABLE,
+  PG_NUMERIC_OVERFLOW,
+  PG_QUERY_CANCELED,
+  PG_UNIQUE_VIOLATION,
+} from './transactions.constants';
 
 interface ExpectedIdempotencyPayload {
   type: TransactionType;
@@ -130,13 +138,11 @@ export class TransactionsService {
       toAccountNumber: dto.toAccountNumber,
     };
 
-    const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
-
+    const queryRunner = await this.startTransactionWithLockTimeout();
     let actorAccountId: string | null = null;
 
     try {
+      // 1. Tải và khóa dòng (SELECT ... FOR UPDATE) cả tài khoản nguồn & đích theo id ASC
       const { actorAccount, destAccount } =
         await this.loadAccountsForTransaction(
           queryRunner.manager,
@@ -146,6 +152,7 @@ export class TransactionsService {
       this.validateActorAccount(actorAccount);
       actorAccountId = actorAccount.id;
 
+      // 2. Kiểm tra Idempotency-Key sau khi đã giữ khóa trên tài khoản thực hiện
       const existingTx = await this.findExistingByIdempotencyKey(
         queryRunner.manager,
         actorAccountId,
@@ -160,14 +167,20 @@ export class TransactionsService {
         );
       }
 
+      // 3. Kiểm tra tài khoản đích và kiểm tra số dư từ dữ liệu vừa đọc sau khi khóa
       const validDest = this.validateDestinationAccount(
         destAccount,
         actorAccount,
       );
+      this.ensureSufficientLockedBalance(actorAccount.balance, dto.amount);
 
+      // 4. Trừ tiền tài khoản nguồn (giữ điều kiện WHERE balance >= :amount làm dây an toàn thứ 2)
       await this.debitAccount(queryRunner.manager, actorAccount.id, dto.amount);
+
+      // 5. Cộng tiền tài khoản đích
       await this.creditAccount(queryRunner.manager, validDest.id, dto.amount);
 
+      // 6. Ghi bản ghi giao dịch
       const savedTx = await this.insertTransactionRecord(queryRunner.manager, {
         actorAccountId: actorAccount.id,
         fromAccountId: actorAccount.id,
@@ -215,13 +228,11 @@ export class TransactionsService {
       toAccountNumber: null,
     };
 
-    const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
-
+    const queryRunner = await this.startTransactionWithLockTimeout();
     let actorAccountId: string | null = null;
 
     try {
+      // 1. Tải và khóa dòng tài khoản bằng SELECT ... FOR UPDATE
       const { actorAccount } = await this.loadAccountsForTransaction(
         queryRunner.manager,
         userId,
@@ -229,6 +240,7 @@ export class TransactionsService {
       this.validateActorAccount(actorAccount);
       actorAccountId = actorAccount.id;
 
+      // 2. Kiểm tra Idempotency-Key
       const existingTx = await this.findExistingByIdempotencyKey(
         queryRunner.manager,
         actorAccountId,
@@ -243,12 +255,14 @@ export class TransactionsService {
         );
       }
 
+      // 3. Cộng tiền vào tài khoản
       await this.creditAccount(
         queryRunner.manager,
         actorAccount.id,
         dto.amount,
       );
 
+      // 4. Ghi bản ghi giao dịch
       const savedTx = await this.insertTransactionRecord(queryRunner.manager, {
         actorAccountId: actorAccount.id,
         fromAccountId: null,
@@ -292,13 +306,11 @@ export class TransactionsService {
       toAccountNumber: null,
     };
 
-    const queryRunner = this.dataSource.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
-
+    const queryRunner = await this.startTransactionWithLockTimeout();
     let actorAccountId: string | null = null;
 
     try {
+      // 1. Tải và khóa dòng tài khoản bằng SELECT ... FOR UPDATE
       const { actorAccount } = await this.loadAccountsForTransaction(
         queryRunner.manager,
         userId,
@@ -306,6 +318,7 @@ export class TransactionsService {
       this.validateActorAccount(actorAccount);
       actorAccountId = actorAccount.id;
 
+      // 2. Kiểm tra Idempotency-Key
       const existingTx = await this.findExistingByIdempotencyKey(
         queryRunner.manager,
         actorAccountId,
@@ -320,8 +333,13 @@ export class TransactionsService {
         );
       }
 
+      // 3. Kiểm tra số dư ngay trên dữ liệu vừa đọc sau khi khóa
+      this.ensureSufficientLockedBalance(actorAccount.balance, dto.amount);
+
+      // 4. Trừ tiền (kèm điều kiện WHERE balance >= :amount làm dây an toàn thứ 2)
       await this.debitAccount(queryRunner.manager, actorAccount.id, dto.amount);
 
+      // 5. Ghi bản ghi giao dịch
       const savedTx = await this.insertTransactionRecord(queryRunner.manager, {
         actorAccountId: actorAccount.id,
         fromAccountId: actorAccount.id,
@@ -352,17 +370,60 @@ export class TransactionsService {
   }
 
   // =========================================================================
-  // CÁC BƯỚC DÙNG CHUNG TRONG LUỒNG GIAO DỊCH (HẠNG MỤC C)
+  // CÁC BƯỚC DÙNG CHUNG TRONG LUỒNG GIAO DỊCH
   // =========================================================================
 
+  /**
+   * Mở Database Transaction và đặt SET LOCAL lock_timeout bên trong transaction
+   * để tránh hiện tượng các request chờ khóa bị treo vô hạn.
+   */
+  private async startTransactionWithLockTimeout(): Promise<QueryRunner> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    await queryRunner.query(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
+    return queryRunner;
+  }
+
   private validatePositiveAmount(amount: string): void {
-    if (parseFloat(amount) <= 0) {
+    if (this.parseDecimalToCents(amount) <= 0n) {
       throw new BadRequestException('Số tiền giao dịch phải lớn hơn 0');
     }
   }
 
   /**
-   * Tải tất cả account liên quan trong MỘT truy vấn duy nhất, sắp xếp theo account.id ASC
+   * Chuyển chuỗi số tiền decimal (VD: "100000.50") sang đơn vị xu dạng BigInt (10000050n)
+   * giúp so sánh số tiền chính xác tuyệt đối, không dùng kiểu số thực (float).
+   */
+  private parseDecimalToCents(decimalStr: string): bigint {
+    const trimmed = decimalStr.trim();
+    const isNegative = trimmed.startsWith('-');
+    const normalized = isNegative ? trimmed.slice(1) : trimmed;
+    const [intPart = '0', fracPart = ''] = normalized.split('.');
+    const paddedFrac = (fracPart + '00').slice(0, 2);
+    const cents = BigInt(intPart) * 100n + BigInt(paddedFrac);
+    return isNegative ? -cents : cents;
+  }
+
+  /**
+   * Kiểm tra số dư được đọc SAU KHI đã khóa dòng bằng SELECT ... FOR UPDATE
+   */
+  private ensureSufficientLockedBalance(
+    lockedBalance: string,
+    requiredAmount: string,
+  ): void {
+    if (
+      this.parseDecimalToCents(lockedBalance) <
+      this.parseDecimalToCents(requiredAmount)
+    ) {
+      throw new UnprocessableEntityException('Không đủ số dư khả dụng');
+    }
+  }
+
+  /**
+   * Tải và khóa dòng (SELECT ... FOR UPDATE OF "account") cho tất cả account liên quan
+   * trong MỘT truy vấn duy nhất, sắp xếp theo account.id ASC.
+   * Chỉ khóa bảng 'account' (không khóa bảng 'user') để tránh cạm bẫy khóa dư thừa khi JOIN.
    */
   private async loadAccountsForTransaction(
     manager: EntityManager,
@@ -372,6 +433,7 @@ export class TransactionsService {
     const qb = manager
       .createQueryBuilder(Account, 'account')
       .innerJoinAndSelect('account.user', 'user')
+      .setLock('pessimistic_write', undefined, ['account'])
       .where('account.user_id = :userId', { userId });
 
     if (toAccountNumber) {
@@ -440,13 +502,12 @@ export class TransactionsService {
   ) {
     const isSameType = existingTx.type === expected.type;
     const isSameAmount =
-      parseFloat(existingTx.amount) === parseFloat(expected.amount);
+      this.parseDecimalToCents(existingTx.amount) ===
+      this.parseDecimalToCents(expected.amount);
     const isSameDesc =
       (existingTx.description || null) === (expected.description || null);
     const existingToAccNum = existingTx.toAccount?.account_number ?? null;
-    const isSameDest =
-      expected.type !== TransactionType.TRANSFER ||
-      existingToAccNum === expected.toAccountNumber;
+    const isSameDest = existingToAccNum === expected.toAccountNumber;
 
     if (isSameType && isSameAmount && isSameDesc && isSameDest) {
       return {
@@ -490,8 +551,7 @@ export class TransactionsService {
         .where('id = :id', { id: accountId, amount })
         .execute();
     } catch (error: any) {
-      // PostgreSQL 22003: numeric_field_overflow (tràn kiểu numeric(18,2))
-      if (error.code === '22003') {
+      if (error.code === PG_NUMERIC_OVERFLOW) {
         throw new UnprocessableEntityException(
           'Số dư tài khoản vượt quá giới hạn cho phép',
         );
@@ -527,28 +587,29 @@ export class TransactionsService {
   }
 
   private async handleTransactionError(
-    queryRunner: {
-      rollbackTransaction: () => Promise<void>;
-      isTransactionActive: boolean;
-    },
+    queryRunner: QueryRunner,
     error: any,
     actorAccountId: string | null,
     idempotencyKey: string,
     expectedPayload: ExpectedIdempotencyPayload,
-  ): Promise<{ isReplay: boolean; transaction: any }> {
+  ): Promise<never | { isReplay: boolean; transaction: any }> {
     if (queryRunner.isTransactionActive) {
       await queryRunner.rollbackTransaction();
     }
 
-    // Xử lý xung đột Idempotency khi 2 request cùng key chạy đồng thời:
-    // - Hoặc chạm Unique Violation (23505) lúc INSERT
-    // - Hoặc request 1 vừa commit làm cạn số dư khiến request 2 nhận UnprocessableEntityException (422)
+    // Bắt lỗi hết thời gian chờ khóa (55P03: lock_not_available) -> trả 503 thân thiện
     if (
-      actorAccountId &&
-      (error.code === '23505' || error instanceof UnprocessableEntityException)
+      error.code === PG_LOCK_NOT_AVAILABLE ||
+      error.code === PG_QUERY_CANCELED
     ) {
+      throw new ServiceUnavailableException(
+        'Hệ thống đang bận, vui lòng thử lại',
+      );
+    }
+
+    if (actorAccountId && error.code === PG_UNIQUE_VIOLATION) {
       const existingTx = await this.findExistingByIdempotencyKey(
-        this.dataSource.manager,
+        queryRunner.manager,
         actorAccountId,
         idempotencyKey,
       );
