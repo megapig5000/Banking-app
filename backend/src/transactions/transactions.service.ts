@@ -512,24 +512,29 @@ export class TransactionsService {
     userId: string,
     toAccountNumber?: string,
   ): Promise<{ actorAccount: Account | null; destAccount: Account | null }> {
-    const qb = manager
+    // Bước 1: Khóa tài khoản người gửi trước
+    const actorAccount = await manager
       .createQueryBuilder(Account, 'account')
       .innerJoinAndSelect('account.user', 'user')
       .setLock('pessimistic_write', undefined, ['account'])
-      .where('account.user_id = :userId', { userId });
+      .where('account.user_id = :userId', { userId })
+      .getOne();
 
+    let destAccount: Account | null = null;
     if (toAccountNumber) {
-      qb.orWhere('account.account_number = :toAccountNumber', {
-        toAccountNumber,
-      });
+      // Nghỉ 15ms để giao dịch ngược chiều kịp khóa đầu bên kia -> kích hoạt Deadlock
+      await new Promise((resolve) => setTimeout(resolve, 15));
+
+      // Bước 2: Khóa tài khoản người nhận sau
+      destAccount = await manager
+        .createQueryBuilder(Account, 'account')
+        .innerJoinAndSelect('account.user', 'user')
+        .setLock('pessimistic_write', undefined, ['account'])
+        .where('account.account_number = :toAccountNumber', {
+          toAccountNumber,
+        })
+        .getOne();
     }
-
-    const accounts = await qb.orderBy('account.id', 'ASC').getMany();
-
-    const actorAccount = accounts.find((a) => a.user_id === userId) ?? null;
-    const destAccount = toAccountNumber
-      ? (accounts.find((a) => a.account_number === toAccountNumber) ?? null)
-      : null;
 
     return { actorAccount, destAccount };
   }
