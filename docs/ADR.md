@@ -8,18 +8,17 @@
 
 ## ADR-002: Why numeric(18,2)
 * **Context**: Cần chọn kiểu dữ liệu lưu trữ và tính toán số tiền (`balance`, `amount`) cho tiền tệ VND.
-* **Decision**: Sử dụng `numeric(18,2)` trong PostgreSQL, truyền và trả dữ liệu qua JSON dưới dạng `string` (ví dụ `"50000.00"`), và thực hiện cộng/trừ trực tiếp bằng biểu thức SQL trong PostgreSQL.
+* **Decision**: Sử dụng `numeric(18,2)` trong PostgreSQL, truyền và trả dữ liệu qua JSON dưới dạng `string` (ví dụ `"50000.00"`), so sánh ở ứng dụng bằng số nguyên `BigInt` (đơn vị xu) và thực hiện cộng/trừ trực tiếp bằng biểu thức SQL trong PostgreSQL.
 * **Reason**: Kiểu `float` hoặc `double` (IEEE 754) bị sai số làm tròn dấu phẩy động, không được phép dùng trong ứng dụng tài chính. `numeric(18,2)` lưu trữ chính xác tuyệt đối tới từng xu và chịu được giá trị lên tới hàng triệu tỷ đồng.
 * **Trade-offs**: TypeORM ánh xạ cột `numeric` thành `string` trong TypeScript nên cần validate định dạng bằng regex `^\d{1,16}(\.\d{1,2})?$` ở DTO và bắt lỗi tràn số (`22003`) ở tầng database.
 
-## ADR-003: Why Database Transaction + Atomic Conditional Update
-* **Context**: Các thao tác biến động số dư (chuyển khoản, nạp tiền, rút tiền) cần đảm bảo không để lại dữ liệu dở dang khi lỗi và không gây âm quỹ khi có nhiều request rút/chuyển tiền đồng thời.
-* **Decision**:
-  1. Bọc toàn bộ các bước kiểm tra, cập nhật số dư và tạo bản ghi giao dịch trong một Database Transaction (`QueryRunner`).
-  2. Trừ tiền bằng câu lệnh nguyên tử có điều kiện: `UPDATE accounts SET balance = balance - :amount WHERE id = :id AND balance >= :amount`. Nếu `affected === 0`, rollback và trả lỗi `422`.
-  3. Tải tất cả các tài khoản liên quan trong một truy vấn duy nhất có `ORDER BY account.id ASC`.
-* **Reason**: Ở mức cô lập mặc định `READ COMMITTED` của PostgreSQL, câu lệnh `UPDATE ... WHERE balance >= :amount` tự động khóa dòng đang cập nhật và đánh giá lại điều kiện `WHERE` sau khi transaction trước commit, ngăn chặn âm quỹ. Việc sắp xếp `account.id ASC` chuẩn bị sẵn thứ tự khóa cố định cho các module nâng cao.
-* **Trade-offs & Known Limitations**: Phiên bản hiện tại chưa bật Pessimistic Locking (`SELECT ... FOR UPDATE`), Optimistic Locking (`version`) và chưa có cơ chế tự động retry khi xảy ra Deadlock (sẽ được triển khai ở Module 1 của bộ bài tập bổ sung).
+## ADR-003: Why Database Transaction + Pessimistic Lock + Atomic Conditional Update (Defense in Depth)
+* **Context**: Các thao tác biến động số dư (chuyển khoản, nạp tiền, rút tiền) cần đảm bảo không để lại dữ liệu dở dang khi lỗi và không xảy ra Lost Update hay âm quỹ khi có nhiều request chạy đồng thời.
+* **Decision**: Áp dụng cơ chế bảo vệ kép ("Thắt dây an toàn kép") bên trong một Database Transaction (`QueryRunner`):
+  1. **Lớp 1 (Pessimistic Locking):** Tải và khóa các dòng tài khoản liên quan bằng `SELECT ... FOR UPDATE OF "account"` (`.setLock('pessimistic_write', undefined, ['account'])`), sắp xếp theo `ORDER BY account.id ASC`, và kiểm tra số dư ngay sau khi khóa.
+  2. **Lớp 2 (Atomic Conditional Update):** Trừ tiền bằng câu lệnh nguyên tử có điều kiện `UPDATE accounts SET balance = balance - :amount WHERE id = :id AND balance >= :amount`.
+* **Reason**: Thực nghiệm ở Bài 1.1 chứng minh chỉ có Database Transaction (`READ COMMITTED`) với `SELECT` thường sẽ bị lỗi Lost Update (20 request rút 100.000đ trên số dư 1.000.000đ đều báo thành công). Kết hợp `SELECT ... FOR UPDATE` với `UPDATE ... WHERE balance >= :amount` đảm bảo dữ liệu đọc ra luôn mới nhất, không một transaction nào xen ngang trong lúc kiểm tra nghiệp vụ, và tầng SQL luôn có chốt chặn chống âm quỹ cuối cùng.
+* **Trade-offs**: Các giao dịch chạm vào cùng một tài khoản tại cùng một thời điểm phải xếp hàng tuần tự, được kiểm soát bởi `SET LOCAL lock_timeout = '5s'` (quá hạn trả `503 Service Unavailable`).
 
 ## ADR-004: Why Idempotency
 * **Context**: Khi mạng chậm hoặc timeout, người dùng hoặc trình duyệt có thể gửi lặp lại cùng một yêu cầu giao dịch, dẫn đến nguy cơ trừ/cộng tiền hai lần.
@@ -56,7 +55,20 @@
      * `deposit`: `from_account_id IS NULL AND to_account_id IS NOT NULL`.
      * `withdraw`: `from_account_id IS NOT NULL AND to_account_id IS NULL`.
   2. Thêm cột `actor_account_id` (`NOT NULL`) đại diện cho tài khoản chủ động thực hiện giao dịch và đặt Unique constraint trên `(idempotency_key, actor_account_id)`.
-* **Reason**:
-  * Không cần tạo tài khoản hệ thống ảo (tránh phải viết ngoại lệ cho phép âm quỹ hoặc ẩn tài khoản ảo khỏi luồng người dùng).
-  * Cột `actor_account_id` giúp cả 3 loại giao dịch (`transfer`, `deposit`, `withdraw`) chia sẻ chung một phạm vi khóa Idempotency duy nhất, ngăn chặn việc dùng lại cùng một `Idempotency-Key` cho loại giao dịch khác (trả về `409 Conflict`) và tương thích 100% với decorator `@Unique` của TypeORM.
-* **Trade-offs**: Bảng `transactions` có thêm cột `actor_account_id`, đổi lại câu truy vấn kiểm tra Idempotency đơn giản, đồng nhất và không dùng index biểu thức phức tạp.
+* **Reason**: Không cần tạo tài khoản hệ thống ảo, đồng thời giúp cả 3 loại giao dịch (`transfer`, `deposit`, `withdraw`) chia sẻ chung một phạm vi khóa Idempotency duy nhất, ngăn chặn việc dùng lại cùng một `Idempotency-Key` cho loại giao dịch khác (trả về `409 Conflict`).
+* **Trade-offs**: Bảng `transactions` có thêm cột `actor_account_id`, đổi lại câu truy vấn kiểm tra Idempotency đơn giản, đồng nhất và tương thích 100% với decorator của TypeORM.
+
+## ADR-009: Why Pessimistic Locking, Canonical Lock Ordering by ID, and Deadlock Retry
+* **Context**:
+  1. Khi một tài khoản nhận nhiều giao dịch đồng thời, cần lựa chọn giữa **Pessimistic Locking** (`SELECT ... FOR UPDATE`) và **Optimistic Locking** (cột `version` + retry) làm cơ chế chính.
+  2. Khi hai tài khoản A và B chuyển tiền chéo cho nhau cùng lúc (A→B và B→A), việc khóa dòng có nguy cơ gây ra **Deadlock** (`40P01`).
+* **Decision**:
+  1. **Chọn Pessimistic Locking làm cơ chế chính trên nhánh sản phẩm (`feat/module1`):** Khóa riêng bảng `account` bằng `.setLock('pessimistic_write', undefined, ['account'])` kèm `SET LOCAL lock_timeout = '5s'` (quá hạn trả `503`).
+  2. **Khóa theo thứ tự cố định (`ORDER BY account.id ASC`):** Tải và khóa cả tài khoản nguồn lẫn tài khoản đích trong một câu truy vấn duy nhất sắp xếp theo `account.id` tăng dần.
+  3. **Bọc vòng lặp Deadlock Retry (`executeWithDeadlockRetry`) bên ngoài Transaction:** Nếu PostgreSQL trả về mã lỗi `40P01`, tự động rollback, ghi log kèm bộ đếm (`deadlockDetected`, `retrySucceeded`, `retryExhausted`), chờ ngẫu nhiên `10–50ms` và thử lại tối đa `3 lần` (`MAX_DEADLOCK_RETRIES = 3`).
+* **Reason (Dẫn chứng bằng số liệu thực nghiệm từ Bài 1.3 & 1.4)**:
+  * Trong benchmark Bài 1.3 ở kịch bản tranh chấp cao **S2** (100 request đồng thời vào 1 tài khoản), **Pessimistic Locking** hoàn thành `100/100` giao dịch (`201`), đạt thông lượng **~275 req/s** và **`0` lỗi `503`**. Ngược lại, **Optimistic Locking** gặp bão thử lại (retry storm), thông lượng giảm còn **~80 req/s** và có **~35–55 request bị trả lỗi `503`** sau khi cạn 5 lần retry.
+  * Trong thực nghiệm Bài 1.4 với 500 giao dịch chuyển khoản chéo A↔B (50 cặp × 5 vòng), khi khóa sai thứ tự (người gửi trước → người nhận sau ở nhánh `exp/1.4-deadlock-demo`), deadlock `40P01` xảy ra liên tục và mất ~15–35 giây để hoàn tất. Khi áp dụng **`ORDER BY account.id ASC`**, số lần deadlock giảm về **`0`** và toàn bộ 500 giao dịch hoàn tất trong **~2.2–4.0 giây**, bảo toàn tuyệt đối tổng số dư `20,000,000.00 VND`.
+* **Trade-offs**:
+  * Pessimistic Locking giữ khóa dòng trong suốt transaction nên nếu một transaction xử lý chậm sẽ làm các request sau trên cùng tài khoản đó phải xếp hàng chờ (đã được bảo vệ bởi `lock_timeout = '5s'`).
+  * Bộ đếm Deadlock hiện lưu trong RAM của tiến trình NodeJS (sẽ reset khi khởi động lại container; việc đẩy metrics ra hệ thống giám sát tập trung thuộc phạm vi Module 6).
