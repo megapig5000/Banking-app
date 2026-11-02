@@ -179,7 +179,6 @@ export class TransactionsService {
       let actorAccountId: string | null = null;
 
       try {
-        // 1. Tải và khóa dòng (SELECT ... FOR UPDATE) cả tài khoản nguồn & đích theo id ASC
         const { actorAccount, destAccount } =
           await this.loadAccountsForTransaction(
             queryRunner.manager,
@@ -189,7 +188,6 @@ export class TransactionsService {
         this.validateActorAccount(actorAccount);
         actorAccountId = actorAccount.id;
 
-        // 2. Kiểm tra Idempotency-Key sau khi đã giữ khóa (replay không sinh thêm bút toán)
         const existingTx = await this.findExistingByIdempotencyKey(
           queryRunner.manager,
           actorAccountId,
@@ -204,28 +202,24 @@ export class TransactionsService {
           );
         }
 
-        // 3. Kiểm tra tài khoản đích và kiểm tra số dư từ dữ liệu vừa đọc sau khi khóa
         const validDest = this.validateDestinationAccount(
           destAccount,
           actorAccount,
         );
         this.ensureSufficientLockedBalance(actorAccount.balance, dto.amount);
 
-        // 4. Trừ tiền tài khoản nguồn và lấy balance_after trực tiếp từ RETURNING
         const senderBalanceAfter = await this.debitAccount(
           queryRunner.manager,
           actorAccount.id,
           dto.amount,
         );
 
-        // 5. Cộng tiền tài khoản đích và lấy balance_after trực tiếp từ RETURNING
         const receiverBalanceAfter = await this.creditAccount(
           queryRunner.manager,
           validDest.id,
           dto.amount,
         );
 
-        // 6. Ghi bản ghi giao dịch (phải ghi trước bút toán để có khóa ngoại transaction_id)
         const savedTx = await this.insertTransactionRecord(
           queryRunner.manager,
           {
@@ -239,7 +233,6 @@ export class TransactionsService {
           },
         );
 
-        // 7. Ghi cặp bút toán sổ cái kép (DEBIT người gửi + CREDIT người nhận, tổng DEBIT = tổng CREDIT)
         await this.insertLedgerEntries(queryRunner.manager, [
           {
             accountId: actorAccount.id,
@@ -340,7 +333,6 @@ export class TransactionsService {
           },
         );
 
-        // Ghi 1 bút toán CREDIT cho giao dịch nạp tiền (mô hình một phía)
         await this.insertLedgerEntries(queryRunner.manager, [
           {
             accountId: actorAccount.id,
@@ -432,7 +424,6 @@ export class TransactionsService {
           },
         );
 
-        // Ghi 1 bút toán DEBIT cho giao dịch rút tiền (mô hình một phía)
         await this.insertLedgerEntries(queryRunner.manager, [
           {
             accountId: actorAccount.id,
@@ -463,14 +454,6 @@ export class TransactionsService {
     });
   }
 
-  // =========================================================================
-  // CÁC BƯỚC DÙNG CHUNG & XỬ LÝ DEADLOCK RETRY
-  // =========================================================================
-
-  /**
-   * Bọc bên ngoài toàn bộ Database Transaction để tự động thử lại khi gặp Deadlock (40P01).
-   * Mỗi lần retry là một transaction hoàn toàn mới, kèm ghi log và cập nhật bộ đếm.
-   */
   private async executeWithDeadlockRetry<T>(
     txType: TransactionType,
     operation: () => Promise<T>,
@@ -558,10 +541,6 @@ export class TransactionsService {
     }
   }
 
-  /**
-   * Tải và khóa dòng (SELECT ... FOR UPDATE OF "account") cho tất cả account liên quan
-   * trong MỘT truy vấn duy nhất, sắp xếp theo account.id ASC.
-   */
   private async loadAccountsForTransaction(
     manager: EntityManager,
     userId: string,
@@ -660,9 +639,6 @@ export class TransactionsService {
     );
   }
 
-  /**
-   * Trừ tiền nguyên tử kèm RETURNING balance để lấy số dư ngay sau biến động ghi vào sổ cái.
-   */
   private async debitAccount(
     manager: EntityManager,
     accountId: string,
@@ -683,9 +659,6 @@ export class TransactionsService {
     return String(debitResult.raw[0].balance);
   }
 
-  /**
-   * Cộng tiền nguyên tử kèm RETURNING balance để lấy số dư ngay sau biến động ghi vào sổ cái.
-   */
   private async creditAccount(
     manager: EntityManager,
     accountId: string,
@@ -733,7 +706,7 @@ export class TransactionsService {
       to_account_id: params.toAccountId,
       amount: params.amount,
       type: params.type,
-      status: TransactionStatus.SUCCESS,
+      status: TransactionStatus.COMPLETED,
       description: params.description,
       idempotency_key: params.idempotencyKey,
     });
@@ -741,10 +714,6 @@ export class TransactionsService {
     return manager.save(tx);
   }
 
-  /**
-   * Bước ghi bút toán vào bảng chỉ-ghi-thêm ledger_entries trong cùng Database Transaction.
-   * Ghi tuần tự từng bút toán qua EntityManager của transaction để giữ thứ tự id rõ ràng.
-   */
   private async insertLedgerEntries(
     manager: EntityManager,
     entries: LedgerEntryInput[],
@@ -771,12 +740,10 @@ export class TransactionsService {
       await queryRunner.rollbackTransaction();
     }
 
-    // Nếu là Deadlock (40P01) -> ném ra ngoài để executeWithDeadlockRetry bắt và thử lại
     if (error.code === PG_DEADLOCK_DETECTED) {
       throw error;
     }
 
-    // Bắt lỗi hết thời gian chờ khóa (55P03: lock_not_available) -> trả 503 thân thiện
     if (
       error.code === PG_LOCK_NOT_AVAILABLE ||
       error.code === PG_QUERY_CANCELED

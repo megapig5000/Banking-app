@@ -7,6 +7,7 @@ import { LedgerEntry } from './entities/ledger-entry.entity';
 import { Baseline1710000000000 } from './migrations/1710000000000-Baseline';
 import { AddDepositWithdrawAndIdempotencyScope1710000001000 } from './migrations/1710000001000-AddDepositWithdrawAndIdempotencyScope';
 import { CreateLedgerEntriesWithBackfillAndTrigger1710000002000 } from './migrations/1710000002000-CreateLedgerEntriesWithBackfillAndTrigger';
+import { UpgradeTransactionsStateMachineAndReversalSchema1710000003000 } from './migrations/1710000003000-UpgradeTransactionsStateMachineAndReversalSchema';
 
 const isTest = process.env.NODE_ENV === 'test';
 dotenv.config({ path: isTest ? '.env.test' : '.env', quiet: true });
@@ -28,6 +29,7 @@ export const dataSourceOptions: DataSourceOptions = {
     Baseline1710000000000,
     AddDepositWithdrawAndIdempotencyScope1710000001000,
     CreateLedgerEntriesWithBackfillAndTrigger1710000002000,
+    UpgradeTransactionsStateMachineAndReversalSchema1710000003000,
   ],
   synchronize: false,
 };
