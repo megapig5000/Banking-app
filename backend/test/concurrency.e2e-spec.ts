@@ -4,7 +4,9 @@ import { App } from 'supertest/types';
 import { DataSource } from 'typeorm';
 import { randomUUID } from 'node:crypto';
 import { Transaction } from '../src/database/entities/transaction.entity';
+import { LedgerEntry } from '../src/database/entities/ledger-entry.entity';
 import {
+  assertLedgerInvariants,
   createAuthenticatedAccount,
   createTestApp,
   resetDatabase,
@@ -76,6 +78,9 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
         .expect(200);
 
       expect(meRes.body.balance).toBe('0.00');
+
+      // Kiểm tra cả 3 bất biến sổ cái Q1, Q2, Q3 sau khi rút đồng thời
+      await assertLedgerInvariants(dataSource);
     }
   });
 
@@ -178,6 +183,9 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
     expect(actualB).toBe(expectedB);
     expect(totalSuccessAtoB).toBe(pairsPerRound * rounds);
     expect(totalSuccessBtoA).toBe(pairsPerRound * rounds);
+
+    // 3. Kiểm tra cả 3 bất biến sổ cái Q1, Q2, Q3 sau 5 vòng chuyển khoản chéo A<->B
+    await assertLedgerInvariants(dataSource);
   });
 
   it('T3: 5 concurrent requests with the SAME Idempotency-Key and payload -> only 1 transaction created, all return same transaction (5 iterations)', async () => {
@@ -199,8 +207,6 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
       );
 
       // Dùng CHUNG một Idempotency-Key cho cả 5 request đồng thời
-      // Lưu ý: Số tiền chuyển = 500,000.00 (rút cạn 100% số dư) để kiểm chứng luôn
-      // việc các request đồng thời cùng key không bị báo nhầm 422 Không đủ số dư.
       const sharedKey = randomUUID();
       const payload = {
         toAccountNumber: receiver.accountNumber,
@@ -231,12 +237,19 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
       // Cả 5 response phải trả về CÙNG một ID giao dịch
       const txIds = new Set(responses.map((r) => r.body.id));
       expect(txIds.size).toBe(1);
+      const createdTxId = responses[0].body.id as string;
 
       // Trong DB chỉ có đúng 1 bản ghi giao dịch với idempotency_key này
       const dbTxCount = await dataSource.getRepository(Transaction).count({
         where: { idempotency_key: sharedKey },
       });
       expect(dbTxCount).toBe(1);
+
+      // Trong sổ cái chỉ có đúng 2 bút toán (1 DEBIT + 1 CREDIT) của giao dịch chuyển khoản này
+      const txLedgerCount = await dataSource.getRepository(LedgerEntry).count({
+        where: { transaction_id: createdTxId },
+      });
+      expect(txLedgerCount).toBe(2);
 
       // Số dư người gửi chỉ bị trừ đúng 1 lần (về 0.00), người nhận tăng lên 500,000.00
       const senderMe = await request(httpServer)
@@ -250,6 +263,9 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
 
       expect(senderMe.body.balance).toBe('0.00');
       expect(receiverMe.body.balance).toBe('500000.00');
+
+      // Kiểm tra cả 3 bất biến sổ cái Q1, Q2, Q3
+      await assertLedgerInvariants(dataSource);
     }
   });
 });
