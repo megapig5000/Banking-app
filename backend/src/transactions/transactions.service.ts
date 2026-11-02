@@ -17,6 +17,10 @@ import {
   TransactionType,
   TransactionStatus,
 } from '../database/entities/transaction.entity';
+import {
+  LedgerEntry,
+  LedgerEntryType,
+} from '../database/entities/ledger-entry.entity';
 import { UserStatus } from '../database/entities/user.entity';
 import { TransferDto } from './dto/transfer.dto';
 import { CashTransactionDto } from './dto/cash-transaction.dto';
@@ -46,6 +50,14 @@ interface ExpectedIdempotencyPayload {
   amount: string;
   description: string | null;
   toAccountNumber: string | null;
+}
+
+interface LedgerEntryInput {
+  accountId: string;
+  transactionId: string;
+  type: LedgerEntryType;
+  amount: string;
+  balanceAfter: string;
 }
 
 export interface DeadlockStats {
@@ -168,7 +180,6 @@ export class TransactionsService {
 
       try {
         // 1. Tải và khóa dòng (SELECT ... FOR UPDATE) cả tài khoản nguồn & đích theo id ASC
-        // Thứ tự cố định theo id ASC giúp phòng ngừa Deadlock khi A->B và B->A chạy cùng lúc.
         const { actorAccount, destAccount } =
           await this.loadAccountsForTransaction(
             queryRunner.manager,
@@ -178,7 +189,7 @@ export class TransactionsService {
         this.validateActorAccount(actorAccount);
         actorAccountId = actorAccount.id;
 
-        // 2. Kiểm tra Idempotency-Key sau khi đã giữ khóa
+        // 2. Kiểm tra Idempotency-Key sau khi đã giữ khóa (replay không sinh thêm bút toán)
         const existingTx = await this.findExistingByIdempotencyKey(
           queryRunner.manager,
           actorAccountId,
@@ -200,17 +211,21 @@ export class TransactionsService {
         );
         this.ensureSufficientLockedBalance(actorAccount.balance, dto.amount);
 
-        // 4. Trừ tiền tài khoản nguồn
-        await this.debitAccount(
+        // 4. Trừ tiền tài khoản nguồn và lấy balance_after trực tiếp từ RETURNING
+        const senderBalanceAfter = await this.debitAccount(
           queryRunner.manager,
           actorAccount.id,
           dto.amount,
         );
 
-        // 5. Cộng tiền tài khoản đích
-        await this.creditAccount(queryRunner.manager, validDest.id, dto.amount);
+        // 5. Cộng tiền tài khoản đích và lấy balance_after trực tiếp từ RETURNING
+        const receiverBalanceAfter = await this.creditAccount(
+          queryRunner.manager,
+          validDest.id,
+          dto.amount,
+        );
 
-        // 6. Ghi bản ghi giao dịch
+        // 6. Ghi bản ghi giao dịch (phải ghi trước bút toán để có khóa ngoại transaction_id)
         const savedTx = await this.insertTransactionRecord(
           queryRunner.manager,
           {
@@ -223,6 +238,24 @@ export class TransactionsService {
             idempotencyKey,
           },
         );
+
+        // 7. Ghi cặp bút toán sổ cái kép (DEBIT người gửi + CREDIT người nhận, tổng DEBIT = tổng CREDIT)
+        await this.insertLedgerEntries(queryRunner.manager, [
+          {
+            accountId: actorAccount.id,
+            transactionId: savedTx.id,
+            type: LedgerEntryType.DEBIT,
+            amount: savedTx.amount,
+            balanceAfter: senderBalanceAfter,
+          },
+          {
+            accountId: validDest.id,
+            transactionId: savedTx.id,
+            type: LedgerEntryType.CREDIT,
+            amount: savedTx.amount,
+            balanceAfter: receiverBalanceAfter,
+          },
+        ]);
 
         await queryRunner.commitTransaction();
 
@@ -288,7 +321,7 @@ export class TransactionsService {
           );
         }
 
-        await this.creditAccount(
+        const balanceAfter = await this.creditAccount(
           queryRunner.manager,
           actorAccount.id,
           dto.amount,
@@ -306,6 +339,17 @@ export class TransactionsService {
             idempotencyKey,
           },
         );
+
+        // Ghi 1 bút toán CREDIT cho giao dịch nạp tiền (mô hình một phía)
+        await this.insertLedgerEntries(queryRunner.manager, [
+          {
+            accountId: actorAccount.id,
+            transactionId: savedTx.id,
+            type: LedgerEntryType.CREDIT,
+            amount: savedTx.amount,
+            balanceAfter,
+          },
+        ]);
 
         await queryRunner.commitTransaction();
 
@@ -369,7 +413,7 @@ export class TransactionsService {
 
         this.ensureSufficientLockedBalance(actorAccount.balance, dto.amount);
 
-        await this.debitAccount(
+        const balanceAfter = await this.debitAccount(
           queryRunner.manager,
           actorAccount.id,
           dto.amount,
@@ -387,6 +431,17 @@ export class TransactionsService {
             idempotencyKey,
           },
         );
+
+        // Ghi 1 bút toán DEBIT cho giao dịch rút tiền (mô hình một phía)
+        await this.insertLedgerEntries(queryRunner.manager, [
+          {
+            accountId: actorAccount.id,
+            transactionId: savedTx.id,
+            type: LedgerEntryType.DEBIT,
+            amount: savedTx.amount,
+            balanceAfter,
+          },
+        ]);
 
         await queryRunner.commitTransaction();
 
@@ -605,35 +660,51 @@ export class TransactionsService {
     );
   }
 
+  /**
+   * Trừ tiền nguyên tử kèm RETURNING balance để lấy số dư ngay sau biến động ghi vào sổ cái.
+   */
   private async debitAccount(
     manager: EntityManager,
     accountId: string,
     amount: string,
-  ): Promise<void> {
+  ): Promise<string> {
     const debitResult = await manager
       .createQueryBuilder()
       .update(Account)
       .set({ balance: () => 'balance - :amount' })
       .where('id = :id AND balance >= :amount', { id: accountId, amount })
+      .returning('balance')
       .execute();
 
-    if (debitResult.affected === 0) {
+    if (debitResult.affected === 0 || !debitResult.raw?.[0]?.balance) {
       throw new UnprocessableEntityException('Không đủ số dư khả dụng');
     }
+
+    return String(debitResult.raw[0].balance);
   }
 
+  /**
+   * Cộng tiền nguyên tử kèm RETURNING balance để lấy số dư ngay sau biến động ghi vào sổ cái.
+   */
   private async creditAccount(
     manager: EntityManager,
     accountId: string,
     amount: string,
-  ): Promise<void> {
+  ): Promise<string> {
     try {
-      await manager
+      const creditResult = await manager
         .createQueryBuilder()
         .update(Account)
         .set({ balance: () => 'balance + :amount' })
         .where('id = :id', { id: accountId, amount })
+        .returning('balance')
         .execute();
+
+      if (creditResult.affected === 0 || !creditResult.raw?.[0]?.balance) {
+        throw new NotFoundException('Không tìm thấy tài khoản nhận tiền');
+      }
+
+      return String(creditResult.raw[0].balance);
     } catch (error: any) {
       if (error.code === PG_NUMERIC_OVERFLOW) {
         throw new UnprocessableEntityException(
@@ -668,6 +739,25 @@ export class TransactionsService {
     });
 
     return manager.save(tx);
+  }
+
+  /**
+   * Bước ghi bút toán vào bảng chỉ-ghi-thêm ledger_entries trong cùng Database Transaction.
+   * Ghi tuần tự từng bút toán qua EntityManager của transaction để giữ thứ tự id rõ ràng.
+   */
+  private async insertLedgerEntries(
+    manager: EntityManager,
+    entries: LedgerEntryInput[],
+  ): Promise<void> {
+    for (const entry of entries) {
+      await manager.insert(LedgerEntry, {
+        account_id: entry.accountId,
+        transaction_id: entry.transactionId,
+        type: entry.type,
+        amount: entry.amount,
+        balance_after: entry.balanceAfter,
+      });
+    }
   }
 
   private async handleTransactionError(

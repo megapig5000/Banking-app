@@ -181,6 +181,77 @@ async function runSeed() {
       );
     }
 
+    // 5. Đồng bộ bút toán sổ cái (ledger_entries) cho mọi giao dịch seed chưa có bút toán
+    // Đảm bảo idempotent: chạy trên DB rỗng hay chạy lại nhiều lần đều khớp tuyệt đối Q1-Q3
+    await queryRunner.query(`
+      WITH raw_entries AS (
+        SELECT
+          t.from_account_id AS account_id,
+          t.id AS transaction_id,
+          'DEBIT'::"public"."ledger_entries_type_enum" AS type,
+          t.amount AS amount,
+          t.created_at AS created_at
+        FROM "transactions" t
+        WHERE t.status = 'success'
+          AND t.from_account_id IS NOT NULL
+
+        UNION ALL
+
+        SELECT
+          t.to_account_id AS account_id,
+          t.id AS transaction_id,
+          'CREDIT'::"public"."ledger_entries_type_enum" AS type,
+          t.amount AS amount,
+          t.created_at AS created_at
+        FROM "transactions" t
+        WHERE t.status = 'success'
+          AND t.to_account_id IS NOT NULL
+      ),
+      ordered_entries AS (
+        SELECT
+          re.account_id,
+          re.transaction_id,
+          re.type,
+          re.amount,
+          SUM(
+            CASE
+              WHEN re.type = 'CREDIT'::"public"."ledger_entries_type_enum" THEN re.amount
+              ELSE -re.amount
+            END
+          ) OVER (
+            PARTITION BY re.account_id
+            ORDER BY re.created_at ASC, re.transaction_id ASC, re.type ASC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+          ) AS balance_after,
+          re.created_at
+        FROM raw_entries re
+      )
+      INSERT INTO "ledger_entries" (
+        "account_id",
+        "transaction_id",
+        "type",
+        "amount",
+        "balance_after",
+        "created_at"
+      )
+      SELECT
+        oe.account_id,
+        oe.transaction_id,
+        oe.type,
+        oe.amount,
+        oe.balance_after,
+        oe.created_at
+      FROM ordered_entries oe
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM "ledger_entries" le
+        WHERE le.transaction_id = oe.transaction_id
+          AND le.account_id = oe.account_id
+          AND le.type = oe.type
+      )
+      ORDER BY oe.created_at ASC, oe.transaction_id ASC, oe.type ASC
+    `);
+
     await queryRunner.commitTransaction();
     console.log('Seed completed successfully.');
   } catch (err) {
