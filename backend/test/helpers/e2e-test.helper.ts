@@ -51,12 +51,67 @@ export async function createTestApp(): Promise<{
 }
 
 /**
- * Làm sạch dữ liệu giữa các bài test để mỗi test độc lập hoàn toàn
+ * Làm sạch dữ liệu giữa các bài test để mỗi test độc lập hoàn toàn.
+ * Lưu ý: Trigger BEFORE UPDATE OR DELETE mức dòng trên ledger_entries không chặn TRUNCATE.
  */
 export async function resetDatabase(dataSource: DataSource): Promise<void> {
   await dataSource.query(
-    'TRUNCATE TABLE "transactions", "accounts", "users" RESTART IDENTITY CASCADE',
+    'TRUNCATE TABLE "ledger_entries", "transactions", "accounts", "users" RESTART IDENTITY CASCADE',
   );
+}
+
+/**
+ * Kiểm tra cả 3 bất biến sổ cái kép (Q1, Q2, Q3).
+ * Kỳ vọng cả 3 truy vấn đều trả về 0 dòng sai lệch.
+ */
+export async function assertLedgerInvariants(
+  dataSource: DataSource,
+): Promise<void> {
+  // Q1 — Mỗi giao dịch success có đúng số lượng bút toán, đủ và cân bằng
+  const q1Violations = await dataSource.query(`
+    SELECT t.id, t.type
+    FROM "transactions" t
+    LEFT JOIN "ledger_entries" le ON le.transaction_id = t.id
+    WHERE t.status = 'success'
+    GROUP BY t.id, t.type, t.amount
+    HAVING CASE t.type
+      WHEN 'transfer' THEN
+           COUNT(le.id) <> 2
+        OR COALESCE(SUM(le.amount) FILTER (WHERE le.type = 'DEBIT'), 0)  <> t.amount
+        OR COALESCE(SUM(le.amount) FILTER (WHERE le.type = 'CREDIT'), 0) <> t.amount
+      WHEN 'deposit' THEN
+           COUNT(le.id) <> 1
+        OR COALESCE(SUM(le.amount) FILTER (WHERE le.type = 'CREDIT'), 0) <> t.amount
+      WHEN 'withdraw' THEN
+           COUNT(le.id) <> 1
+        OR COALESCE(SUM(le.amount) FILTER (WHERE le.type = 'DEBIT'), 0) <> t.amount
+    END
+  `);
+  expect(q1Violations).toEqual([]);
+
+  // Q2 — Số dư hiển thị (accounts.balance) khớp tổng bút toán của từng tài khoản
+  const q2Violations = await dataSource.query(`
+    SELECT a.account_number, a.balance,
+           COALESCE(SUM(CASE le.type WHEN 'CREDIT' THEN le.amount ELSE -le.amount END), 0) AS computed
+    FROM "accounts" a
+    LEFT JOIN "ledger_entries" le ON le.account_id = a.id
+    GROUP BY a.id, a.account_number, a.balance
+    HAVING a.balance <> COALESCE(SUM(CASE le.type WHEN 'CREDIT' THEN le.amount ELSE -le.amount END), 0)
+  `);
+  expect(q2Violations).toEqual([]);
+
+  // Q3 — Cột balance_after của từng dòng khớp với số dư cộng dồn theo thứ tự id
+  const q3Violations = await dataSource.query(`
+    SELECT x.id, x.account_id, x.balance_after, x.running
+    FROM (
+      SELECT le.id, le.account_id, le.balance_after,
+             SUM(CASE le.type WHEN 'CREDIT' THEN le.amount ELSE -le.amount END)
+               OVER (PARTITION BY le.account_id ORDER BY le.id) AS running
+      FROM "ledger_entries" le
+    ) x
+    WHERE x.balance_after <> x.running
+  `);
+  expect(q3Violations).toEqual([]);
 }
 
 /**

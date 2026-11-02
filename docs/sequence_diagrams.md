@@ -38,30 +38,32 @@ sequenceDiagram
     end
 ```
 
-## 2. Transaction Flow (Transfer / Deposit / Withdraw)
+## 2. Transaction & Double-Entry Ledger Flow (Transfer / Deposit / Withdraw)
 
-> **Ghi chú cho Nạp tiền (`deposit`) và Rút tiền (`withdraw`):**
-> * Cả 3 nghiệp vụ (`transfer`, `deposit`, `withdraw`) đều đi qua cùng một cấu trúc bước xử lý trong `TransactionsService`[cite: 9].
-> * Với `deposit`: chỉ tải `actorAccount` (`to_account_id = actorAccount.id`, `from_account_id = NULL`), bỏ qua bước `debitAccount` và chỉ thực hiện `creditAccount` (kèm bắt lỗi tràn số `22003` → `422`).
-> * Với `withdraw`: chỉ tải `actorAccount` (`from_account_id = actorAccount.id`, `to_account_id = NULL`), chỉ thực hiện `debitAccount` có điều kiện `balance >= :amount` và bỏ qua `creditAccount`[cite: 9].
+> **Ghi chú cho Nạp tiền (`deposit`), Rút tiền (`withdraw`) và Sổ cái kép (`ledger_entries`):**
+> * Cả 3 nghiệp vụ (`transfer`, `deposit`, `withdraw`) đều chạy trong `executeWithDeadlockRetry()` và mở transaction có `SET LOCAL lock_timeout = '5s'`.
+> * Với `transfer`: thực hiện cả `debitAccount` và `creditAccount` (lấy số dư mới qua `RETURNING balance`), lưu bản ghi `transactions`, sau đó ghi **2 bút toán cân bằng** (`1 DEBIT` cho tài khoản nguồn + `1 CREDIT` cho tài khoản đích) vào `ledger_entries`.
+> * Với `deposit`: chỉ khóa `actorAccount`, thực hiện `creditAccount (... RETURNING balance)`, lưu bản ghi `transactions`, và ghi **1 bút toán `CREDIT`** vào `ledger_entries`.
+> * Với `withdraw`: chỉ khóa `actorAccount`, kiểm tra số dư đã khóa, thực hiện `debitAccount (... RETURNING balance)`, lưu bản ghi `transactions`, và ghi **1 bút toán `DEBIT`** vào `ledger_entries`.
+> * Nếu xảy ra bất kỳ lỗi nào ở giữa các bước (kể cả lỗi khi đang ghi bút toán), `queryRunner.rollbackTransaction()` hủy toàn bộ thay đổi số dư, giao dịch và bút toán trong transaction đó.
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Controller as TransactionsController
     participant Service as TransactionsService
-    participant Manager as EntityManager (QueryRunner)
+    participant Manager as Repository / EntityManager (TypeORM)
     participant DB as PostgreSQL
 
     Client->>Controller: POST /api/transactions/transfer | deposit | withdraw (Idempotency-Key)
     Controller->>Controller: Validate JWT, UUID Header & DTO
     Controller->>Service: transfer / deposit / withdraw(userId, idempotencyKey, dto)
 
-    Service->>Manager: connect() & startTransaction()
+    Service->>Manager: connect(), startTransaction() & SET LOCAL lock_timeout = '5s'
 
     Service->>Manager: loadAccountsForTransaction(userId, toAccountNumber?)
-    Manager->>DB: SELECT account, user FROM accounts JOIN users ORDER BY account.id ASC
-    DB-->>Manager: accounts[]
+    Manager->>DB: SELECT account, user FROM accounts JOIN users ORDER BY account.id ASC FOR UPDATE OF account
+    DB-->>Manager: locked accounts[]
     Manager-->>Service: { actorAccount, destAccount }
 
     Service->>Manager: findExistingByIdempotencyKey(actorAccount.id, idempotencyKey)
@@ -70,7 +72,7 @@ sequenceDiagram
 
     alt Idempotency Key Already Exists
         Manager-->>Service: existingTx
-        Service->>Manager: rollbackTransaction()
+        Service->>Manager: rollbackTransaction() (No new ledger entries created)
         alt Same Payload (type, amount, description, toAccountNumber)
             Service-->>Controller: { isReplay: true, transaction }
             Controller-->>Client: 200 OK (Replay)
@@ -80,50 +82,42 @@ sequenceDiagram
         end
     else New Idempotency Key
         Manager-->>Service: null
-        Service->>Service: Validate actorAccount & destAccount (active, not self-transfer)
+        Service->>Service: Validate actorAccount, destAccount & locked balance
 
-        alt Validation Failed
+        alt Validation Failed or Insufficient Locked Balance
             Service->>Manager: rollbackTransaction()
             Service-->>Controller: throw 400 / 403 / 404 / 422
             Controller-->>Client: HTTP Error Response
         else Validation Passed
             opt Transfer or Withdraw
                 Service->>Manager: debitAccount(actorAccount.id, amount)
-                Manager->>DB: UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance >= $1
-                DB-->>Manager: affected rows
+                Manager->>DB: UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance >= $1 RETURNING balance
+                DB-->>Manager: senderBalanceAfter
             end
 
-            alt Debit affected == 0 (Insufficient Balance)
-                Service->>Manager: rollbackTransaction()
-                Service-->>Controller: throw UnprocessableEntityException
-                Controller-->>Client: 422 Không đủ số dư khả dụng
-            else Debit OK (or Deposit)
-                opt Transfer or Deposit
-                    Service->>Manager: creditAccount(targetAccount.id, amount)
-                    Manager->>DB: UPDATE accounts SET balance = balance + $1 WHERE id = $2
-                    DB-->>Manager: ok (or 22003 overflow -> Rollback & 422)
-                end
+            opt Transfer or Deposit
+                Service->>Manager: creditAccount(targetAccount.id, amount)
+                Manager->>DB: UPDATE accounts SET balance = balance + $1 WHERE id = $2 RETURNING balance
+                DB-->>Manager: receiverBalanceAfter (or 22003 overflow)
+            end
 
-                Service->>Manager: insertTransactionRecord(...)
-                Manager->>DB: INSERT INTO transactions (actor_account_id, idempotency_key, ...)
+            Service->>Manager: insertTransactionRecord(...)
+            Manager->>DB: INSERT INTO transactions (actor_account_id, idempotency_key, ...) RETURNING id
+            DB-->>Manager: savedTx
 
-                alt Concurrent Duplicate Idempotency Key (Error 23505)
-                    DB-->>Manager: Unique Violation 23505
-                    Service->>Manager: rollbackTransaction()
-                    Service->>DB: SELECT existing transaction by (idempotency_key, actor_account_id)
-                    alt Same Payload
-                        Service-->>Controller: { isReplay: true, transaction }
-                        Controller-->>Client: 200 OK (Replay)
-                    else Different Payload
-                        Service-->>Controller: throw ConflictException
-                        Controller-->>Client: 409 Conflict
-                    end
-                else Insert Success
-                    DB-->>Manager: savedTx
-                    Service->>Manager: commitTransaction()
-                    Service-->>Controller: { isReplay: false, transaction }
-                    Controller-->>Client: 201 Created
-                end
+            Service->>Manager: insertLedgerEntries(entries[])
+            Manager->>DB: INSERT INTO ledger_entries (account_id, transaction_id, type, amount, balance_after)
+
+            alt Mid-Transaction Error (DB Error / Overflow 22003 / Lock Timeout 55P03 / Crash)
+                DB-->>Manager: Error
+                Service->>Manager: rollbackTransaction() (Revert balance updates, transaction & any partial ledger entries)
+                Service-->>Controller: throw 422 / 503 / 500 Exception
+                Controller-->>Client: Error Response (No orphaned ledger entries)
+            else All Steps Succeeded
+                DB-->>Manager: ledger entries inserted
+                Service->>Manager: commitTransaction()
+                Service-->>Controller: { isReplay: false, transaction }
+                Controller-->>Client: 201 Created
             end
         end
     end
