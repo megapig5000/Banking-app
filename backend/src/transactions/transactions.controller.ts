@@ -8,7 +8,6 @@ import {
   Request,
   BadRequestException,
   Res,
-  HttpStatus,
 } from '@nestjs/common';
 import { TransactionsService } from './transactions.service';
 import { TransferDto } from './dto/transfer.dto';
@@ -56,11 +55,17 @@ export class TransactionsController {
   })
   @ApiResponse({
     status: 201,
-    description: 'Chuyển khoản thành công (giao dịch mới)',
+    description: 'Chuyển khoản thành công (giao dịch mới COMPLETED)',
   })
   @ApiResponse({
     status: 200,
-    description: 'Trả về giao dịch cũ nếu gửi lại cùng Idempotency Key',
+    description:
+      'Trả về giao dịch cũ nếu gửi lại cùng Idempotency Key (COMPLETED/REVERSED)',
+  })
+  @ApiResponse({
+    status: 202,
+    description:
+      'Giao dịch cùng Idempotency Key đang được xử lý (INITIATED/PENDING_OTP/PROCESSING)',
   })
   @ApiResponse({
     status: 400,
@@ -72,7 +77,8 @@ export class TransactionsController {
   })
   @ApiResponse({
     status: 422,
-    description: 'Không đủ số dư hoặc tài khoản đích bị khóa',
+    description:
+      'Không đủ số dư hoặc tài khoản đích bị khóa (ghi nhận FAILED kèm failure_code)',
   })
   @ApiResponse({
     status: 503,
@@ -90,9 +96,7 @@ export class TransactionsController {
       transferDto,
     );
 
-    return res
-      .status(result.isReplay ? HttpStatus.OK : HttpStatus.CREATED)
-      .json(result.transaction);
+    return res.status(result.statusCode).json(result.transaction);
   }
 
   @Post('deposit')
@@ -104,11 +108,17 @@ export class TransactionsController {
   })
   @ApiResponse({
     status: 201,
-    description: 'Nạp tiền thành công (giao dịch mới)',
+    description: 'Nạp tiền thành công (giao dịch mới COMPLETED)',
   })
   @ApiResponse({
     status: 200,
-    description: 'Trả về giao dịch cũ nếu gửi lại cùng Idempotency Key',
+    description:
+      'Trả về giao dịch cũ nếu gửi lại cùng Idempotency Key (COMPLETED/REVERSED)',
+  })
+  @ApiResponse({
+    status: 202,
+    description:
+      'Giao dịch cùng Idempotency Key đang được xử lý (INITIATED/PENDING_OTP/PROCESSING)',
   })
   @ApiResponse({
     status: 400,
@@ -138,9 +148,7 @@ export class TransactionsController {
       depositDto,
     );
 
-    return res
-      .status(result.isReplay ? HttpStatus.OK : HttpStatus.CREATED)
-      .json(result.transaction);
+    return res.status(result.statusCode).json(result.transaction);
   }
 
   @Post('withdraw')
@@ -152,11 +160,17 @@ export class TransactionsController {
   })
   @ApiResponse({
     status: 201,
-    description: 'Rút tiền thành công (giao dịch mới)',
+    description: 'Rút tiền thành công (giao dịch mới COMPLETED)',
   })
   @ApiResponse({
     status: 200,
-    description: 'Trả về giao dịch cũ nếu gửi lại cùng Idempotency Key',
+    description:
+      'Trả về giao dịch cũ nếu gửi lại cùng Idempotency Key (COMPLETED/REVERSED)',
+  })
+  @ApiResponse({
+    status: 202,
+    description:
+      'Giao dịch cùng Idempotency Key đang được xử lý (INITIATED/PENDING_OTP/PROCESSING)',
   })
   @ApiResponse({
     status: 400,
@@ -168,7 +182,7 @@ export class TransactionsController {
   })
   @ApiResponse({
     status: 422,
-    description: 'Không đủ số dư khả dụng',
+    description: 'Không đủ số dư khả dụng (ghi nhận FAILED)',
   })
   @ApiResponse({
     status: 503,
@@ -186,9 +200,7 @@ export class TransactionsController {
       withdrawDto,
     );
 
-    return res
-      .status(result.isReplay ? HttpStatus.OK : HttpStatus.CREATED)
-      .json(result.transaction);
+    return res.status(result.statusCode).json(result.transaction);
   }
 
   private extractIdempotencyKey(req: any): string {
