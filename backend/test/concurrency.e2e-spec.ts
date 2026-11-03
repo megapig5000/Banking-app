@@ -3,7 +3,11 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { DataSource } from 'typeorm';
 import { randomUUID } from 'node:crypto';
-import { Transaction } from '../src/database/entities/transaction.entity';
+import {
+  Transaction,
+  TransactionStatus,
+  TransactionType,
+} from '../src/database/entities/transaction.entity';
 import { LedgerEntry } from '../src/database/entities/ledger-entry.entity';
 import {
   assertLedgerInvariants,
@@ -12,8 +16,6 @@ import {
   resetDatabase,
 } from './helpers/e2e-test.helper';
 
-// Tăng timeout cho Jest vì các bài test bắn nhiều request đồng thời qua 5 vòng liên tiếp
-// và xếp hàng chờ khóa SELECT ... FOR UPDATE cũng như chờ kết nối trong DB pool.
 jest.setTimeout(60000);
 
 describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
@@ -36,8 +38,9 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
     }
   });
 
-  it('T1: 20 concurrent withdrawals of 100,000 on 1,000,000 balance -> exactly 10 succeed (201), 10 fail (422), final balance = 0.00 (5 iterations)', async () => {
+  it('T1: 20 concurrent withdrawals of 100,000 on 1,000,000 balance -> exactly 10 succeed (201 COMPLETED), 10 fail (422 FAILED), final balance = 0.00 (5 iterations)', async () => {
     const httpServer = app.getHttpServer();
+    const txRepo = dataSource.getRepository(Transaction);
     const iterations = 5;
 
     for (let round = 1; round <= iterations; round++) {
@@ -71,6 +74,24 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
       expect(count201).toBe(10);
       expect(count422).toBe(10);
 
+      // Trong DB phải có đúng 10 giao dịch WITHDRAW COMPLETED và 10 giao dịch WITHDRAW FAILED
+      const completedWithdraws = await txRepo.count({
+        where: {
+          actor_account_id: acc.accountId,
+          type: TransactionType.WITHDRAW,
+          status: TransactionStatus.COMPLETED,
+        },
+      });
+      const failedWithdraws = await txRepo.count({
+        where: {
+          actor_account_id: acc.accountId,
+          type: TransactionType.WITHDRAW,
+          status: TransactionStatus.FAILED,
+        },
+      });
+      expect(completedWithdraws).toBe(10);
+      expect(failedWithdraws).toBe(10);
+
       // Kiểm tra số dư cuối cùng trong DB phải chính xác tuyệt đối = 0.00
       const meRes = await request(httpServer)
         .get('/api/accounts/me')
@@ -79,7 +100,7 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
 
       expect(meRes.body.balance).toBe('0.00');
 
-      // Kiểm tra cả 3 bất biến sổ cái Q1, Q2, Q3 sau khi rút đồng thời
+      // Kiểm tra bộ 5 bất biến Q1'-Q5
       await assertLedgerInvariants(dataSource);
     }
   });
@@ -184,11 +205,11 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
     expect(totalSuccessAtoB).toBe(pairsPerRound * rounds);
     expect(totalSuccessBtoA).toBe(pairsPerRound * rounds);
 
-    // 3. Kiểm tra cả 3 bất biến sổ cái Q1, Q2, Q3 sau 5 vòng chuyển khoản chéo A<->B
+    // 3. Kiểm tra bộ 5 bất biến Q1'-Q5
     await assertLedgerInvariants(dataSource);
   });
 
-  it('T3: 5 concurrent requests with the SAME Idempotency-Key and payload -> only 1 transaction created, all return same transaction (5 iterations)', async () => {
+  it('T3: 5 concurrent requests with the SAME Idempotency-Key and payload -> only 1 transaction created, all responses in {201, 200, 202} with same transaction ID (5 iterations)', async () => {
     const httpServer = app.getHttpServer();
     const iterations = 5;
 
@@ -224,26 +245,29 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
 
       const responses = await Promise.all(tasks);
 
-      // Tất cả 5 request phải trả về 201 (tạo mới) hoặc 200 (replay), tuyệt đối không có 422 hay 500
+      // Tất cả 5 request phải trả về trong tập {200, 201, 202}, tuyệt đối không có 422 hay 500
       for (const res of responses) {
-        expect([200, 201]).toContain(res.status);
+        expect([200, 201, 202]).toContain(res.status);
       }
 
       const count201 = responses.filter((r) => r.status === 201).length;
-      const count200 = responses.filter((r) => r.status === 200).length;
+      const countReplay = responses.filter(
+        (r) => r.status === 200 || r.status === 202,
+      ).length;
       expect(count201).toBe(1);
-      expect(count200).toBe(4);
+      expect(countReplay).toBe(4);
 
       // Cả 5 response phải trả về CÙNG một ID giao dịch
       const txIds = new Set(responses.map((r) => r.body.id));
       expect(txIds.size).toBe(1);
       const createdTxId = responses[0].body.id as string;
 
-      // Trong DB chỉ có đúng 1 bản ghi giao dịch với idempotency_key này
-      const dbTxCount = await dataSource.getRepository(Transaction).count({
+      // Trong DB chỉ có đúng 1 bản ghi giao dịch với idempotency_key này và trạng thái cuối là COMPLETED
+      const dbTxs = await dataSource.getRepository(Transaction).find({
         where: { idempotency_key: sharedKey },
       });
-      expect(dbTxCount).toBe(1);
+      expect(dbTxs).toHaveLength(1);
+      expect(dbTxs[0].status).toBe(TransactionStatus.COMPLETED);
 
       // Trong sổ cái chỉ có đúng 2 bút toán (1 DEBIT + 1 CREDIT) của giao dịch chuyển khoản này
       const txLedgerCount = await dataSource.getRepository(LedgerEntry).count({
@@ -264,7 +288,7 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
       expect(senderMe.body.balance).toBe('0.00');
       expect(receiverMe.body.balance).toBe('500000.00');
 
-      // Kiểm tra cả 3 bất biến sổ cái Q1, Q2, Q3
+      // Kiểm tra bộ 5 bất biến Q1'-Q5
       await assertLedgerInvariants(dataSource);
     }
   });

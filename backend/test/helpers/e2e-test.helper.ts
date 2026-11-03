@@ -5,6 +5,7 @@ import { App } from 'supertest/types';
 import { DataSource } from 'typeorm';
 import { randomUUID } from 'node:crypto';
 import { AppModule } from '../../src/app.module';
+import { User, UserRole } from '../../src/database/entities/user.entity';
 
 export interface TestAccountContext {
   userId: string;
@@ -198,4 +199,19 @@ export async function createAuthenticatedAccount(
     accountNumber: meRes.body.accountNumber,
     balance: meRes.body.balance,
   };
+}
+
+/**
+ * Helper tạo nhanh 1 tài khoản Admin (role = UserRole.ADMIN) phục vụ test hoàn tiền REVERSAL
+ */
+export async function createAuthenticatedAdmin(
+  app: INestApplication<App>,
+  dataSource: DataSource,
+  label = 'Admin',
+): Promise<TestAccountContext> {
+  const ctx = await createAuthenticatedAccount(app, label);
+  await dataSource
+    .getRepository(User)
+    .update({ id: ctx.userId }, { role: UserRole.ADMIN });
+  return ctx;
 }
