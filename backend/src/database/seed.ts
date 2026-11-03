@@ -20,6 +20,31 @@ async function runSeed() {
   try {
     const passwordHash = await bcrypt.hash('Password@123', 10);
 
+    // 0. Tạo System Admin (phục vụ nghiệp vụ hoàn tiền REVERSAL - Module 3B)
+    let adminUser = await queryRunner.manager.findOne(User, {
+      where: { email: 'admin@bank.local' },
+    });
+    if (!adminUser) {
+      adminUser = queryRunner.manager.create(User, {
+        full_name: 'System Admin',
+        email: 'admin@bank.local',
+        password_hash: passwordHash,
+        role: UserRole.ADMIN,
+        status: UserStatus.ACTIVE,
+      });
+      adminUser = await queryRunner.manager.save(adminUser);
+
+      await queryRunner.manager.save(
+        queryRunner.manager.create(Account, {
+          user_id: adminUser.id,
+          account_number: '1000000000',
+          balance: '0.00',
+          currency: 'VND',
+        }),
+      );
+      console.log('Created Admin User (admin@bank.local)');
+    }
+
     // 1. Tạo Customer A
     let user1 = await queryRunner.manager.findOne(User, {
       where: { email: 'user1@bank.local' },
@@ -95,7 +120,7 @@ async function runSeed() {
       console.log('Created User 3 (Locked Customer)');
     }
 
-    // 4. Seed Transaction History nhất quán với số dư (Hạng mục D)
+    // 4. Seed Transaction History nhất quán với số dư
     const acc1 = await queryRunner.manager.findOne(Account, {
       where: { account_number: '1000000001' },
     });
@@ -125,12 +150,6 @@ async function runSeed() {
         now.getTime() - 60 * 24 * 60 * 60 * 1000,
       );
 
-      // 4.1. Giao dịch nạp tiền khởi tạo (created_at sớm hơn mọi giao dịch khác)
-      // Trong 25 giao dịch transfer bên dưới:
-      // - A chuyển sang B (i chẵn: 0..24, 13 giao dịch): tổng 1,690,000.00
-      // - B chuyển sang A (i lẻ: 1..23, 12 giao dịch): tổng 1,560,000.00
-      // Biến động ròng từ transfer: A = -130,000.00; B = +130,000.00; C = 0.00
-      // Do đó nạp khởi tạo: A = 5,130,000.00; B = 1,870,000.00; C = 1,000,000.00
       const initialDeposits = [
         { account: acc1, amount: '5130000.00' },
         { account: acc2, amount: '1870000.00' },
@@ -145,15 +164,15 @@ async function runSeed() {
             to_account_id: item.account.id,
             amount: item.amount,
             type: TransactionType.DEPOSIT,
-            status: TransactionStatus.SUCCESS,
+            status: TransactionStatus.COMPLETED,
             description: 'Số dư khởi tạo',
             idempotency_key: uuidv4(),
             created_at: initialDepositDate,
+            updated_at: initialDepositDate,
           }),
         );
       }
 
-      // 4.2. 25 giao dịch chuyển khoản xen kẽ giữa Customer A và Customer B
       for (let i = 0; i < 25; i++) {
         const isAtoB = i % 2 === 0;
         const sender = isAtoB ? acc1 : acc2;
@@ -167,10 +186,11 @@ async function runSeed() {
             to_account_id: receiver.id,
             amount: ((i + 1) * 10000).toFixed(2),
             type: TransactionType.TRANSFER,
-            status: TransactionStatus.SUCCESS,
+            status: TransactionStatus.COMPLETED,
             description: `Test transaction ${i + 1}`,
             idempotency_key: uuidv4(),
             created_at: txDate,
+            updated_at: txDate,
           }),
         );
       }
@@ -181,8 +201,7 @@ async function runSeed() {
       );
     }
 
-    // 5. Đồng bộ bút toán sổ cái (ledger_entries) cho mọi giao dịch seed chưa có bút toán
-    // Đảm bảo idempotent: chạy trên DB rỗng hay chạy lại nhiều lần đều khớp tuyệt đối Q1-Q3
+    // 5. Đồng bộ bút toán sổ cái (ledger_entries) cho mọi giao dịch COMPLETED/REVERSED chưa có bút toán
     await queryRunner.query(`
       WITH raw_entries AS (
         SELECT
@@ -192,7 +211,7 @@ async function runSeed() {
           t.amount AS amount,
           t.created_at AS created_at
         FROM "transactions" t
-        WHERE t.status = 'success'
+        WHERE t.status IN ('COMPLETED', 'REVERSED')
           AND t.from_account_id IS NOT NULL
 
         UNION ALL
@@ -204,7 +223,7 @@ async function runSeed() {
           t.amount AS amount,
           t.created_at AS created_at
         FROM "transactions" t
-        WHERE t.status = 'success'
+        WHERE t.status IN ('COMPLETED', 'REVERSED')
           AND t.to_account_id IS NOT NULL
       ),
       ordered_entries AS (

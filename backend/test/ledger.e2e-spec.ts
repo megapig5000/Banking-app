@@ -7,7 +7,11 @@ import {
   LedgerEntry,
   LedgerEntryType,
 } from '../src/database/entities/ledger-entry.entity';
-import { Transaction } from '../src/database/entities/transaction.entity';
+import {
+  Transaction,
+  TransactionStatus,
+} from '../src/database/entities/transaction.entity';
+import { TransactionFailureCode } from '../src/transactions/transactions.constants';
 import { TransactionsService } from '../src/transactions/transactions.service';
 import {
   assertLedgerInvariants,
@@ -270,10 +274,10 @@ describe('Module 3A (3.1 & 7.3) — Double-entry Ledger & Mid-Transaction Rollba
   });
 
   // =========================================================================
-  // BÀI 7.3 — TEST ROLLBACK KHI LỖI GIỮA CHỪNG (R1, R2)
+  // BÀI 7.3 — TEST ROLLBACK KHI LỖI GIỮA CHỪNG (R1, R2 - CẬP NHẬT CHO MODULE 3B)
   // =========================================================================
 
-  it('R1: rolls back sender debit completely when an error occurs right after debitAccount and before creditAccount', async () => {
+  it('R1: rolls back sender debit completely when an error occurs right after debitAccount and before creditAccount (records FAILED transaction with 0 ledger entries)', async () => {
     const httpServer = app.getHttpServer();
     const txRepo = dataSource.getRepository(Transaction);
     const ledgerRepo = dataSource.getRepository(LedgerEntry);
@@ -289,7 +293,6 @@ describe('Module 3A (3.1 & 7.3) — Double-entry Ledger & Mid-Transaction Rollba
       '200000.00',
     );
 
-    const txCountBefore = await txRepo.count();
     const ledgerCountBefore = await ledgerRepo.count();
 
     // Giả lập lỗi ngay tại bước cộng tiền tài khoản đích (sau khi đã trừ tiền tài khoản nguồn)
@@ -314,7 +317,7 @@ describe('Module 3A (3.1 & 7.3) — Double-entry Ledger & Mid-Transaction Rollba
     expect(creditSpy).toHaveBeenCalledTimes(1);
     expect(res.body.message).toBe('Lỗi hệ thống khi thực hiện giao dịch');
 
-    // 1. Số dư của cả A và B hoàn toàn không đổi (khoản trừ 300,000 của A đã được rollback)
+    // 1. Số dư của cả A và B hoàn toàn không đổi (khoản trừ 300,000 của A ở Pha B đã được rollback)
     const meSender = await request(httpServer)
       .get('/api/accounts/me')
       .set('Authorization', `Bearer ${sender.token}`)
@@ -327,14 +330,18 @@ describe('Module 3A (3.1 & 7.3) — Double-entry Ledger & Mid-Transaction Rollba
     expect(meSender.body.balance).toBe('1000000.00');
     expect(meReceiver.body.balance).toBe('200000.00');
 
-    // 2. Không có bản ghi giao dịch và không có bút toán nào được lưu thêm
-    expect(await txRepo.count()).toBe(txCountBefore);
+    // 2. Có đúng 1 phiếu FAILED (INTERNAL_ERROR) được Pha C ghi nhận, nhưng 0 bút toán mới trong sổ cái
+    const failedTx = await txRepo.findOneByOrFail({
+      idempotency_key: failedKey,
+    });
+    expect(failedTx.status).toBe(TransactionStatus.FAILED);
+    expect(failedTx.failure_code).toBe(TransactionFailureCode.INTERNAL_ERROR);
     expect(await ledgerRepo.count()).toBe(ledgerCountBefore);
 
     await assertLedgerInvariants(dataSource);
   });
 
-  it('R2: rolls back everything (no orphaned DEBIT entry) when an error occurs after inserting DEBIT ledger entry and before inserting CREDIT ledger entry', async () => {
+  it('R2: rolls back Phase B completely (no orphaned DEBIT entry, records FAILED transaction) when an error occurs after inserting DEBIT ledger entry and before inserting CREDIT ledger entry', async () => {
     const httpServer = app.getHttpServer();
     const txRepo = dataSource.getRepository(Transaction);
     const ledgerRepo = dataSource.getRepository(LedgerEntry);
@@ -350,11 +357,10 @@ describe('Module 3A (3.1 & 7.3) — Double-entry Ledger & Mid-Transaction Rollba
       '200000.00',
     );
 
-    const txCountBefore = await txRepo.count();
     const ledgerCountBefore = await ledgerRepo.count();
 
     // Giả lập lỗi trong insertLedgerEntries:
-    // Cho phép ghi thật bút toán đầu tiên (DEBIT của A) vào DB trong transaction,
+    // Cho phép ghi thật bút toán đầu tiên (DEBIT của A) vào DB trong transaction Pha B,
     // sau đó ném lỗi ngay trước khi ghi bút toán thứ hai (CREDIT của B).
     const insertLedgerSpy = jest
       .spyOn(transactionsService as any, 'insertLedgerEntries')
@@ -410,8 +416,12 @@ describe('Module 3A (3.1 & 7.3) — Double-entry Ledger & Mid-Transaction Rollba
     expect(meSender.body.balance).toBe('1000000.00');
     expect(meReceiver.body.balance).toBe('200000.00');
 
-    // 2. Tuyệt đối không có bút toán DEBIT mồ côi nào còn sót lại trong DB
-    expect(await txRepo.count()).toBe(txCountBefore);
+    // 2. Có đúng 1 phiếu FAILED (INTERNAL_ERROR) và tuyệt đối không có bút toán DEBIT mồ côi nào trong DB
+    const failedTx = await txRepo.findOneByOrFail({
+      idempotency_key: failedKey,
+    });
+    expect(failedTx.status).toBe(TransactionStatus.FAILED);
+    expect(failedTx.failure_code).toBe(TransactionFailureCode.INTERNAL_ERROR);
     expect(await ledgerRepo.count()).toBe(ledgerCountBefore);
 
     await assertLedgerInvariants(dataSource);

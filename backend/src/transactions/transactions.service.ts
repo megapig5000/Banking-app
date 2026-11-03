@@ -4,13 +4,21 @@ import {
   BadRequestException,
   NotFoundException,
   UnprocessableEntityException,
-  InternalServerErrorException,
   ConflictException,
   ForbiddenException,
   ServiceUnavailableException,
+  HttpException,
+  HttpStatus,
 } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, QueryRunner, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  In,
+  QueryRunner,
+  Repository,
+} from 'typeorm';
 import { Account } from '../database/entities/account.entity';
 import {
   Transaction,
@@ -24,6 +32,7 @@ import {
 import { UserStatus } from '../database/entities/user.entity';
 import { TransferDto } from './dto/transfer.dto';
 import { CashTransactionDto } from './dto/cash-transaction.dto';
+import { ReverseTransactionDto } from './dto/reverse-transaction.dto';
 import {
   TransactionQueryDto,
   TransactionDirection,
@@ -34,6 +43,8 @@ import {
   getVietnamNextDayStart,
 } from '../common/utils/date.util';
 import {
+  canTransition,
+  FAILURE_CODE_MAP,
   LOCK_TIMEOUT,
   MAX_DEADLOCK_RETRIES,
   PG_DEADLOCK_DETECTED,
@@ -43,6 +54,8 @@ import {
   PG_UNIQUE_VIOLATION,
   RETRY_DELAY_MAX_MS,
   RETRY_DELAY_MIN_MS,
+  STUCK_AFTER_SECONDS,
+  TransactionFailureCode,
 } from './transactions.constants';
 
 interface ExpectedIdempotencyPayload {
@@ -50,6 +63,7 @@ interface ExpectedIdempotencyPayload {
   amount: string;
   description: string | null;
   toAccountNumber: string | null;
+  originalTransactionId?: string | null;
 }
 
 interface LedgerEntryInput {
@@ -60,10 +74,35 @@ interface LedgerEntryInput {
   balanceAfter: string;
 }
 
+interface PhaseAInitiationResult {
+  isReplay: boolean;
+  statusCode?: number;
+  transactionResponse?: any;
+  initiatedTx?: Transaction;
+  actorAccountId: string;
+  destAccountNumber: string | null;
+}
+
 export interface DeadlockStats {
   deadlockDetected: number;
   retrySucceeded: number;
   retryExhausted: number;
+}
+
+export interface SweepStuckResult {
+  sweptCount: number;
+  skippedWithLedgerCount: number;
+  sweptIds: string[];
+}
+
+/**
+ * Lỗi nghiệp vụ nội bộ mang sẵn TransactionFailureCode để Pha C ghi nhận chính xác
+ */
+class BusinessTransactionError extends Error {
+  constructor(public readonly failureCode: TransactionFailureCode) {
+    super(FAILURE_CODE_MAP[failureCode].message);
+    this.name = 'BusinessTransactionError';
+  }
 }
 
 @Injectable()
@@ -88,6 +127,143 @@ export class TransactionsService {
   getDeadlockStats(): DeadlockStats {
     return { ...this.deadlockStats };
   }
+
+  // =========================================================================
+  // STATE MACHINE: CHUYỂN TRẠNG THÁI CÓ ĐIỀU KIỆN (BÀI 3.2 & 5.3)
+  // =========================================================================
+
+  /**
+   * Hàm duy nhất được phép thay đổi cột `status` của bảng `transactions`.
+   * Thực hiện đóng dấu có điều kiện: UPDATE ... SET status = :to, updated_at = now() WHERE id = :id AND status = :from
+   */
+  async transition(
+    manager: EntityManager,
+    transactionId: string,
+    from: TransactionStatus,
+    to: TransactionStatus,
+    extras?: { failureCode?: TransactionFailureCode | null },
+  ): Promise<void> {
+    if (!canTransition(from, to)) {
+      this.logger.error(
+        `[InvalidStateTransition] Chuyển trạng thái không hợp lệ: ${from} -> ${to} (txId: ${transactionId})`,
+      );
+      throw new ConflictException(
+        `Không thể chuyển trạng thái giao dịch từ ${from} sang ${to}`,
+      );
+    }
+
+    const updateValues: Record<string, any> = {
+      status: to,
+      updated_at: () => 'now()',
+    };
+
+    if (extras && extras.failureCode !== undefined) {
+      updateValues.failure_code = extras.failureCode;
+    }
+
+    const result = await manager
+      .createQueryBuilder()
+      .update(Transaction)
+      .set(updateValues)
+      .where('id = :id AND status = :from', { id: transactionId, from })
+      .execute();
+
+    if (result.affected === 0) {
+      throw new ConflictException(
+        `Trạng thái giao dịch đã thay đổi (không còn ở trạng thái ${from})`,
+      );
+    }
+  }
+
+  // =========================================================================
+  // JOB QUÉT GIAO DỊCH TREO (STUCK TRANSACTIONS SWEEP - BÀI 5.3)
+  // =========================================================================
+
+  /**
+   * Cron job tự động chạy mỗi phút để phát hiện và đóng dấu FAILED (TIMEOUT) cho các giao dịch treo.
+   * Trong môi trường test (NODE_ENV === 'test'), tắt lịch tự chạy để test chủ động gọi sweepStuckTransactions().
+   */
+  @Cron(CronExpression.EVERY_MINUTE)
+  async handleStuckTransactionsCron(): Promise<void> {
+    if (process.env.NODE_ENV === 'test') {
+      return;
+    }
+    await this.sweepStuckTransactions();
+  }
+
+  /**
+   * Tìm các giao dịch PROCESSING có updated_at cũ hơn STUCK_AFTER_SECONDS (mặc định 120s):
+   * - Nếu chưa có bút toán nào trong ledger_entries: chuyển sang FAILED (failure_code = TIMEOUT) và log WARN.
+   * - Nếu đã có bút toán trong ledger_entries (bất thường trái thiết kế): log ERROR và giữ nguyên để xử lý thủ công.
+   */
+  async sweepStuckTransactions(
+    stuckAfterSeconds: number = STUCK_AFTER_SECONDS,
+  ): Promise<SweepStuckResult> {
+    const candidates: Array<{
+      id: string;
+      type: TransactionType;
+      ledger_count: string;
+    }> = await this.dataSource.query(
+      `
+      SELECT t.id,
+             t.type,
+             COUNT(le.id)::text AS ledger_count
+      FROM "transactions" t
+      LEFT JOIN "ledger_entries" le ON le.transaction_id = t.id
+      WHERE t.status = 'PROCESSING'
+        AND t.updated_at < NOW() - ($1 * INTERVAL '1 second')
+      GROUP BY t.id, t.type, t.updated_at
+      ORDER BY t.updated_at ASC
+      `,
+      [stuckAfterSeconds],
+    );
+
+    let sweptCount = 0;
+    let skippedWithLedgerCount = 0;
+    const sweptIds: string[] = [];
+
+    for (const candidate of candidates) {
+      const ledgerCount = parseInt(candidate.ledger_count, 10);
+
+      if (ledgerCount > 0) {
+        skippedWithLedgerCount += 1;
+        this.logger.error(
+          `[StuckSweepAnomaly] Phát hiện giao dịch PROCESSING (${candidate.id}, type=${candidate.type}) ` +
+            `đã có ${ledgerCount} bút toán trong sổ cái! Không tự động đổi trạng thái để bảo toàn dữ liệu.`,
+        );
+        continue;
+      }
+
+      try {
+        await this.transition(
+          this.dataSource.manager,
+          candidate.id,
+          TransactionStatus.PROCESSING,
+          TransactionStatus.FAILED,
+          { failureCode: TransactionFailureCode.TIMEOUT },
+        );
+        sweptCount += 1;
+        sweptIds.push(candidate.id);
+        this.logger.warn(
+          `[StuckTransactionSwept] Đã đánh dấu FAILED (TIMEOUT) cho giao dịch treo: id=${candidate.id}, type=${candidate.type}`,
+        );
+      } catch {
+        // Nếu ngay lúc quét mà giao dịch vừa được Pha B chuyển sang COMPLETED/FAILED thì bỏ qua an toàn
+      }
+    }
+
+    if (sweptCount > 0 || skippedWithLedgerCount > 0) {
+      this.logger.warn(
+        `[StuckSweepSummary] Hoàn tất quét giao dịch treo: swept=${sweptCount}, anomalySkipped=${skippedWithLedgerCount}`,
+      );
+    }
+
+    return { sweptCount, skippedWithLedgerCount, sweptIds };
+  }
+
+  // =========================================================================
+  // LỊCH SỬ GIAO DỊCH (CÓ originalTransactionId & reversalTransactionId)
+  // =========================================================================
 
   async getTransactions(userId: string, query: TransactionQueryDto) {
     const {
@@ -149,8 +325,29 @@ export class TransactionsService {
 
     const [transactions, total] = await qb.getManyAndCount();
 
+    const reversedIds = transactions
+      .filter((tx) => tx.status === TransactionStatus.REVERSED)
+      .map((tx) => tx.id);
+
+    const reversalMap = new Map<string, string>();
+    if (reversedIds.length > 0) {
+      const completedReversals = await this.transactionRepository.find({
+        where: {
+          original_transaction_id: In(reversedIds),
+          type: TransactionType.REVERSAL,
+          status: TransactionStatus.COMPLETED,
+        },
+        select: { id: true, original_transaction_id: true },
+      });
+      for (const rev of completedReversals) {
+        if (rev.original_transaction_id) {
+          reversalMap.set(rev.original_transaction_id, rev.id);
+        }
+      }
+    }
+
     const data = transactions.map((tx) =>
-      this.mapTransactionItem(tx, accountId),
+      this.mapTransactionItem(tx, accountId, reversalMap.get(tx.id) ?? null),
     );
 
     return {
@@ -164,6 +361,10 @@ export class TransactionsService {
     };
   }
 
+  // =========================================================================
+  // 4 NGHIỆP VỤ GIAO DỊCH THEO LUỒNG 3 PHA (TRANSFER, DEPOSIT, WITHDRAW, REVERSAL)
+  // =========================================================================
+
   async transfer(userId: string, idempotencyKey: string, dto: TransferDto) {
     this.validatePositiveAmount(dto.amount);
     const sanitizedDesc = sanitizeHtml(dto.description || '') || null;
@@ -174,111 +375,107 @@ export class TransactionsService {
       toAccountNumber: dto.toAccountNumber,
     };
 
-    return this.executeWithDeadlockRetry(TransactionType.TRANSFER, async () => {
-      const queryRunner = await this.startTransactionWithLockTimeout();
-      let actorAccountId: string | null = null;
+    const phaseA = await this.initiateTransactionPhaseA(
+      userId,
+      idempotencyKey,
+      expectedPayload,
+    );
+    if (phaseA.isReplay) {
+      return {
+        statusCode: phaseA.statusCode!,
+        transaction: phaseA.transactionResponse,
+      };
+    }
 
-      try {
-        // 1. Tải và khóa dòng (SELECT ... FOR UPDATE) cả tài khoản nguồn & đích theo id ASC
-        const { actorAccount, destAccount } =
-          await this.loadAccountsForTransaction(
-            queryRunner.manager,
-            userId,
-            dto.toAccountNumber,
-          );
-        this.validateActorAccount(actorAccount);
-        actorAccountId = actorAccount.id;
+    const initiatedTx = phaseA.initiatedTx!;
 
-        // 2. Kiểm tra Idempotency-Key sau khi đã giữ khóa (replay không sinh thêm bút toán)
-        const existingTx = await this.findExistingByIdempotencyKey(
-          queryRunner.manager,
-          actorAccountId,
-          idempotencyKey,
-        );
-        if (existingTx) {
-          await queryRunner.rollbackTransaction();
-          return this.resolveIdempotencyReplay(
-            existingTx,
-            actorAccountId,
-            expectedPayload,
-          );
-        }
+    try {
+      const completedTx = await this.executeWithDeadlockRetry(
+        TransactionType.TRANSFER,
+        async () => {
+          const queryRunner = await this.startTransactionWithLockTimeout();
+          try {
+            const { actorAccount, destAccount } =
+              await this.loadAccountsForTransaction(
+                queryRunner.manager,
+                userId,
+                dto.toAccountNumber,
+              );
+            this.validateActorAccount(actorAccount);
+            const validDest = this.validateDestinationAccountInPhaseB(
+              destAccount,
+              actorAccount,
+            );
+            this.ensureSufficientLockedBalance(
+              actorAccount.balance,
+              dto.amount,
+            );
 
-        // 3. Kiểm tra tài khoản đích và kiểm tra số dư từ dữ liệu vừa đọc sau khi khóa
-        const validDest = this.validateDestinationAccount(
-          destAccount,
-          actorAccount,
-        );
-        this.ensureSufficientLockedBalance(actorAccount.balance, dto.amount);
+            const senderBalanceAfter = await this.debitAccount(
+              queryRunner.manager,
+              actorAccount.id,
+              dto.amount,
+            );
 
-        // 4. Trừ tiền tài khoản nguồn và lấy balance_after trực tiếp từ RETURNING
-        const senderBalanceAfter = await this.debitAccount(
-          queryRunner.manager,
-          actorAccount.id,
-          dto.amount,
-        );
+            const receiverBalanceAfter = await this.creditAccount(
+              queryRunner.manager,
+              validDest.id,
+              dto.amount,
+            );
 
-        // 5. Cộng tiền tài khoản đích và lấy balance_after trực tiếp từ RETURNING
-        const receiverBalanceAfter = await this.creditAccount(
-          queryRunner.manager,
-          validDest.id,
-          dto.amount,
-        );
+            await this.insertLedgerEntries(queryRunner.manager, [
+              {
+                accountId: actorAccount.id,
+                transactionId: initiatedTx.id,
+                type: LedgerEntryType.DEBIT,
+                amount: initiatedTx.amount,
+                balanceAfter: senderBalanceAfter,
+              },
+              {
+                accountId: validDest.id,
+                transactionId: initiatedTx.id,
+                type: LedgerEntryType.CREDIT,
+                amount: initiatedTx.amount,
+                balanceAfter: receiverBalanceAfter,
+              },
+            ]);
 
-        // 6. Ghi bản ghi giao dịch (phải ghi trước bút toán để có khóa ngoại transaction_id)
-        const savedTx = await this.insertTransactionRecord(
-          queryRunner.manager,
-          {
-            actorAccountId: actorAccount.id,
-            fromAccountId: actorAccount.id,
-            toAccountId: validDest.id,
-            amount: dto.amount,
-            type: TransactionType.TRANSFER,
-            description: sanitizedDesc,
-            idempotencyKey,
-          },
-        );
+            await this.transition(
+              queryRunner.manager,
+              initiatedTx.id,
+              TransactionStatus.PROCESSING,
+              TransactionStatus.COMPLETED,
+            );
 
-        // 7. Ghi cặp bút toán sổ cái kép (DEBIT người gửi + CREDIT người nhận, tổng DEBIT = tổng CREDIT)
-        await this.insertLedgerEntries(queryRunner.manager, [
-          {
-            accountId: actorAccount.id,
-            transactionId: savedTx.id,
-            type: LedgerEntryType.DEBIT,
-            amount: savedTx.amount,
-            balanceAfter: senderBalanceAfter,
-          },
-          {
-            accountId: validDest.id,
-            transactionId: savedTx.id,
-            type: LedgerEntryType.CREDIT,
-            amount: savedTx.amount,
-            balanceAfter: receiverBalanceAfter,
-          },
-        ]);
+            await queryRunner.commitTransaction();
 
-        await queryRunner.commitTransaction();
+            initiatedTx.status = TransactionStatus.COMPLETED;
+            return initiatedTx;
+          } catch (err: any) {
+            if (queryRunner.isTransactionActive) {
+              await queryRunner.rollbackTransaction();
+            }
+            throw err;
+          } finally {
+            await queryRunner.release();
+          }
+        },
+      );
 
-        return {
-          isReplay: false,
-          transaction: this.mapTransactionResponse(
-            savedTx,
-            'outgoing',
-            validDest.account_number,
-          ),
-        };
-      } catch (error: any) {
-        return await this.handleTransactionError(
-          queryRunner,
-          error,
-          actorAccountId,
-          idempotencyKey,
-          expectedPayload,
-        );
-      } finally {
-        await queryRunner.release();
-      }
-    });
+      return {
+        statusCode: HttpStatus.CREATED,
+        transaction: this.mapTransactionResponse(
+          completedTx,
+          'outgoing',
+          phaseA.destAccountNumber,
+          null,
+        ),
+      };
+    } catch (phaseBError: any) {
+      const failureCode = this.classifyPhaseBFailure(phaseBError);
+      await this.recordFailedTransactionPhaseC(initiatedTx.id, failureCode);
+      this.throwFailureException(failureCode);
+    }
   }
 
   async deposit(
@@ -295,80 +492,84 @@ export class TransactionsService {
       toAccountNumber: null,
     };
 
-    return this.executeWithDeadlockRetry(TransactionType.DEPOSIT, async () => {
-      const queryRunner = await this.startTransactionWithLockTimeout();
-      let actorAccountId: string | null = null;
+    const phaseA = await this.initiateTransactionPhaseA(
+      userId,
+      idempotencyKey,
+      expectedPayload,
+    );
+    if (phaseA.isReplay) {
+      return {
+        statusCode: phaseA.statusCode!,
+        transaction: phaseA.transactionResponse,
+      };
+    }
 
-      try {
-        const { actorAccount } = await this.loadAccountsForTransaction(
-          queryRunner.manager,
-          userId,
-        );
-        this.validateActorAccount(actorAccount);
-        actorAccountId = actorAccount.id;
+    const initiatedTx = phaseA.initiatedTx!;
 
-        const existingTx = await this.findExistingByIdempotencyKey(
-          queryRunner.manager,
-          actorAccountId,
-          idempotencyKey,
-        );
-        if (existingTx) {
-          await queryRunner.rollbackTransaction();
-          return this.resolveIdempotencyReplay(
-            existingTx,
-            actorAccountId,
-            expectedPayload,
-          );
-        }
+    try {
+      const completedTx = await this.executeWithDeadlockRetry(
+        TransactionType.DEPOSIT,
+        async () => {
+          const queryRunner = await this.startTransactionWithLockTimeout();
+          try {
+            const { actorAccount } = await this.loadAccountsForTransaction(
+              queryRunner.manager,
+              userId,
+            );
+            this.validateActorAccount(actorAccount);
 
-        const balanceAfter = await this.creditAccount(
-          queryRunner.manager,
-          actorAccount.id,
-          dto.amount,
-        );
+            const balanceAfter = await this.creditAccount(
+              queryRunner.manager,
+              actorAccount.id,
+              dto.amount,
+            );
 
-        const savedTx = await this.insertTransactionRecord(
-          queryRunner.manager,
-          {
-            actorAccountId: actorAccount.id,
-            fromAccountId: null,
-            toAccountId: actorAccount.id,
-            amount: dto.amount,
-            type: TransactionType.DEPOSIT,
-            description: sanitizedDesc,
-            idempotencyKey,
-          },
-        );
+            await this.insertLedgerEntries(queryRunner.manager, [
+              {
+                accountId: actorAccount.id,
+                transactionId: initiatedTx.id,
+                type: LedgerEntryType.CREDIT,
+                amount: initiatedTx.amount,
+                balanceAfter,
+              },
+            ]);
 
-        // Ghi 1 bút toán CREDIT cho giao dịch nạp tiền (mô hình một phía)
-        await this.insertLedgerEntries(queryRunner.manager, [
-          {
-            accountId: actorAccount.id,
-            transactionId: savedTx.id,
-            type: LedgerEntryType.CREDIT,
-            amount: savedTx.amount,
-            balanceAfter,
-          },
-        ]);
+            await this.transition(
+              queryRunner.manager,
+              initiatedTx.id,
+              TransactionStatus.PROCESSING,
+              TransactionStatus.COMPLETED,
+            );
 
-        await queryRunner.commitTransaction();
+            await queryRunner.commitTransaction();
 
-        return {
-          isReplay: false,
-          transaction: this.mapTransactionResponse(savedTx, 'incoming', null),
-        };
-      } catch (error: any) {
-        return await this.handleTransactionError(
-          queryRunner,
-          error,
-          actorAccountId,
-          idempotencyKey,
-          expectedPayload,
-        );
-      } finally {
-        await queryRunner.release();
-      }
-    });
+            initiatedTx.status = TransactionStatus.COMPLETED;
+            return initiatedTx;
+          } catch (err: any) {
+            if (queryRunner.isTransactionActive) {
+              await queryRunner.rollbackTransaction();
+            }
+            throw err;
+          } finally {
+            await queryRunner.release();
+          }
+        },
+      );
+
+      return {
+        statusCode: HttpStatus.CREATED,
+        transaction: this.mapTransactionResponse(
+          completedTx,
+          'incoming',
+          null,
+          null,
+        ),
+      };
+    } catch (phaseBError: any) {
+      const failureCode = this.classifyPhaseBFailure(phaseBError);
+      await this.recordFailedTransactionPhaseC(initiatedTx.id, failureCode);
+      this.throwFailureException(failureCode);
+    }
   }
 
   async withdraw(
@@ -385,92 +586,708 @@ export class TransactionsService {
       toAccountNumber: null,
     };
 
-    return this.executeWithDeadlockRetry(TransactionType.WITHDRAW, async () => {
-      const queryRunner = await this.startTransactionWithLockTimeout();
-      let actorAccountId: string | null = null;
+    const phaseA = await this.initiateTransactionPhaseA(
+      userId,
+      idempotencyKey,
+      expectedPayload,
+    );
+    if (phaseA.isReplay) {
+      return {
+        statusCode: phaseA.statusCode!,
+        transaction: phaseA.transactionResponse,
+      };
+    }
 
-      try {
-        const { actorAccount } = await this.loadAccountsForTransaction(
-          queryRunner.manager,
-          userId,
+    const initiatedTx = phaseA.initiatedTx!;
+
+    try {
+      const completedTx = await this.executeWithDeadlockRetry(
+        TransactionType.WITHDRAW,
+        async () => {
+          const queryRunner = await this.startTransactionWithLockTimeout();
+          try {
+            const { actorAccount } = await this.loadAccountsForTransaction(
+              queryRunner.manager,
+              userId,
+            );
+            this.validateActorAccount(actorAccount);
+            this.ensureSufficientLockedBalance(
+              actorAccount.balance,
+              dto.amount,
+            );
+
+            const balanceAfter = await this.debitAccount(
+              queryRunner.manager,
+              actorAccount.id,
+              dto.amount,
+            );
+
+            await this.insertLedgerEntries(queryRunner.manager, [
+              {
+                accountId: actorAccount.id,
+                transactionId: initiatedTx.id,
+                type: LedgerEntryType.DEBIT,
+                amount: initiatedTx.amount,
+                balanceAfter,
+              },
+            ]);
+
+            await this.transition(
+              queryRunner.manager,
+              initiatedTx.id,
+              TransactionStatus.PROCESSING,
+              TransactionStatus.COMPLETED,
+            );
+
+            await queryRunner.commitTransaction();
+
+            initiatedTx.status = TransactionStatus.COMPLETED;
+            return initiatedTx;
+          } catch (err: any) {
+            if (queryRunner.isTransactionActive) {
+              await queryRunner.rollbackTransaction();
+            }
+            throw err;
+          } finally {
+            await queryRunner.release();
+          }
+        },
+      );
+
+      return {
+        statusCode: HttpStatus.CREATED,
+        transaction: this.mapTransactionResponse(
+          completedTx,
+          'outgoing',
+          null,
+          null,
+        ),
+      };
+    } catch (phaseBError: any) {
+      const failureCode = this.classifyPhaseBFailure(phaseBError);
+      await this.recordFailedTransactionPhaseC(initiatedTx.id, failureCode);
+      this.throwFailureException(failureCode);
+    }
+  }
+
+  async reverseTransaction(
+    adminUserId: string,
+    originalTransactionId: string,
+    idempotencyKey: string,
+    dto: ReverseTransactionDto,
+  ) {
+    const sanitizedReason = sanitizeHtml(dto.reason?.trim() || '') || null;
+    const reversalDescription = sanitizedReason
+      ? `Hoàn tiền giao dịch ${originalTransactionId}: ${sanitizedReason}`.slice(
+          0,
+          255,
+        )
+      : `Hoàn tiền giao dịch ${originalTransactionId}`;
+
+    const phaseA = await this.initiateReversalPhaseA(
+      adminUserId,
+      originalTransactionId,
+      idempotencyKey,
+      reversalDescription,
+    );
+    if (phaseA.isReplay) {
+      return {
+        statusCode: phaseA.statusCode!,
+        transaction: phaseA.transactionResponse,
+      };
+    }
+
+    const reversalTx = phaseA.initiatedTx!;
+
+    try {
+      const completedReversal = await this.executeWithDeadlockRetry(
+        TransactionType.REVERSAL,
+        async () => {
+          const queryRunner = await this.startTransactionWithLockTimeout();
+          try {
+            const originalEntries = await queryRunner.manager.find(
+              LedgerEntry,
+              {
+                where: { transaction_id: originalTransactionId },
+                order: { id: 'ASC' },
+              },
+            );
+
+            if (originalEntries.length === 0) {
+              throw new BusinessTransactionError(
+                TransactionFailureCode.INTERNAL_ERROR,
+              );
+            }
+
+            const accountIdsToLock = Array.from(
+              new Set(originalEntries.map((e) => e.account_id)),
+            );
+
+            const lockedAccounts = await queryRunner.manager
+              .createQueryBuilder(Account, 'account')
+              .setLock('pessimistic_write', undefined, ['account'])
+              .where('account.id IN (:...ids)', { ids: accountIdsToLock })
+              .orderBy('account.id', 'ASC')
+              .getMany();
+
+            const accountMap = new Map(lockedAccounts.map((a) => [a.id, a]));
+
+            for (const origEntry of originalEntries) {
+              if (origEntry.type === LedgerEntryType.CREDIT) {
+                const targetAcc = accountMap.get(origEntry.account_id);
+                if (!targetAcc) {
+                  throw new BusinessTransactionError(
+                    TransactionFailureCode.INTERNAL_ERROR,
+                  );
+                }
+                this.ensureSufficientLockedBalance(
+                  targetAcc.balance,
+                  origEntry.amount,
+                  TransactionFailureCode.REVERSAL_INSUFFICIENT_BALANCE,
+                );
+              }
+            }
+
+            const inverseEntriesToInsert: LedgerEntryInput[] = [];
+
+            for (const origEntry of originalEntries) {
+              if (origEntry.type === LedgerEntryType.CREDIT) {
+                const balanceAfter = await this.debitAccount(
+                  queryRunner.manager,
+                  origEntry.account_id,
+                  origEntry.amount,
+                  TransactionFailureCode.REVERSAL_INSUFFICIENT_BALANCE,
+                );
+                inverseEntriesToInsert.push({
+                  accountId: origEntry.account_id,
+                  transactionId: reversalTx.id,
+                  type: LedgerEntryType.DEBIT,
+                  amount: origEntry.amount,
+                  balanceAfter,
+                });
+              } else {
+                const balanceAfter = await this.creditAccount(
+                  queryRunner.manager,
+                  origEntry.account_id,
+                  origEntry.amount,
+                );
+                inverseEntriesToInsert.push({
+                  accountId: origEntry.account_id,
+                  transactionId: reversalTx.id,
+                  type: LedgerEntryType.CREDIT,
+                  amount: origEntry.amount,
+                  balanceAfter,
+                });
+              }
+            }
+
+            await this.insertLedgerEntries(
+              queryRunner.manager,
+              inverseEntriesToInsert,
+            );
+
+            await this.transition(
+              queryRunner.manager,
+              reversalTx.id,
+              TransactionStatus.PROCESSING,
+              TransactionStatus.COMPLETED,
+            );
+
+            await this.transition(
+              queryRunner.manager,
+              originalTransactionId,
+              TransactionStatus.COMPLETED,
+              TransactionStatus.REVERSED,
+            );
+
+            await queryRunner.commitTransaction();
+
+            reversalTx.status = TransactionStatus.COMPLETED;
+            return reversalTx;
+          } catch (err: any) {
+            if (queryRunner.isTransactionActive) {
+              await queryRunner.rollbackTransaction();
+            }
+            throw err;
+          } finally {
+            await queryRunner.release();
+          }
+        },
+      );
+
+      return {
+        statusCode: HttpStatus.CREATED,
+        transaction: this.mapTransactionResponse(
+          completedReversal,
+          completedReversal.from_account_id ? 'outgoing' : 'incoming',
+          phaseA.destAccountNumber,
+          null,
+        ),
+      };
+    } catch (phaseBError: any) {
+      if (phaseBError instanceof ConflictException) {
+        await this.recordFailedTransactionPhaseC(
+          reversalTx.id,
+          TransactionFailureCode.INTERNAL_ERROR,
         );
-        this.validateActorAccount(actorAccount);
-        actorAccountId = actorAccount.id;
+        throw phaseBError;
+      }
 
+      const failureCode = this.classifyPhaseBFailure(phaseBError);
+      await this.recordFailedTransactionPhaseC(reversalTx.id, failureCode);
+      this.throwFailureException(failureCode);
+    }
+  }
+
+  // =========================================================================
+  // CHI TIẾT PHA A, PHA C & XỬ LÝ REPLAY THEO TRẠNG THÁI
+  // =========================================================================
+
+  private async initiateTransactionPhaseA(
+    userId: string,
+    idempotencyKey: string,
+    expected: ExpectedIdempotencyPayload,
+  ): Promise<PhaseAInitiationResult> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    let actorAccountId: string | null = null;
+
+    try {
+      const actorAccount = await queryRunner.manager.findOne(Account, {
+        where: { user_id: userId },
+        relations: { user: true },
+      });
+      this.validateActorAccount(actorAccount);
+      actorAccountId = actorAccount.id;
+
+      const existingTx = await this.findExistingByIdempotencyKey(
+        queryRunner.manager,
+        actorAccountId,
+        idempotencyKey,
+      );
+      if (existingTx) {
+        await queryRunner.rollbackTransaction();
+        const replay = await this.resolveIdempotencyReplay(
+          queryRunner.manager,
+          existingTx,
+          actorAccountId,
+          expected,
+        );
+        return {
+          isReplay: true,
+          statusCode: replay.statusCode,
+          transactionResponse: replay.transaction,
+          actorAccountId,
+          destAccountNumber: expected.toAccountNumber,
+        };
+      }
+
+      let fromAccountId: string | null = null;
+      let toAccountId: string | null = null;
+      let destAccountNumber: string | null = null;
+
+      if (expected.type === TransactionType.TRANSFER) {
+        const destAccount = await queryRunner.manager.findOne(Account, {
+          where: { account_number: expected.toAccountNumber! },
+        });
+        if (!destAccount) {
+          throw new NotFoundException('Tài khoản đích không tồn tại');
+        }
+        if (destAccount.id === actorAccount.id) {
+          throw new BadRequestException(
+            'Không thể tự chuyển tiền cho chính mình',
+          );
+        }
+        fromAccountId = actorAccount.id;
+        toAccountId = destAccount.id;
+        destAccountNumber = destAccount.account_number;
+      } else if (expected.type === TransactionType.DEPOSIT) {
+        fromAccountId = null;
+        toAccountId = actorAccount.id;
+      } else if (expected.type === TransactionType.WITHDRAW) {
+        fromAccountId = actorAccount.id;
+        toAccountId = null;
+      }
+
+      const createdTx = queryRunner.manager.create(Transaction, {
+        actor_account_id: actorAccount.id,
+        from_account_id: fromAccountId,
+        to_account_id: toAccountId,
+        original_transaction_id: null,
+        amount: expected.amount,
+        type: expected.type,
+        status: TransactionStatus.INITIATED,
+        failure_code: null,
+        description: expected.description,
+        idempotency_key: idempotencyKey,
+      });
+
+      const savedTx = await queryRunner.manager.save(createdTx);
+
+      await this.transition(
+        queryRunner.manager,
+        savedTx.id,
+        TransactionStatus.INITIATED,
+        TransactionStatus.PROCESSING,
+      );
+      savedTx.status = TransactionStatus.PROCESSING;
+
+      await queryRunner.commitTransaction();
+
+      return {
+        isReplay: false,
+        initiatedTx: savedTx,
+        actorAccountId,
+        destAccountNumber,
+      };
+    } catch (error: any) {
+      if (queryRunner.isTransactionActive) {
+        await queryRunner.rollbackTransaction();
+      }
+
+      if (actorAccountId && error?.code === PG_UNIQUE_VIOLATION) {
         const existingTx = await this.findExistingByIdempotencyKey(
           queryRunner.manager,
           actorAccountId,
           idempotencyKey,
         );
         if (existingTx) {
-          await queryRunner.rollbackTransaction();
-          return this.resolveIdempotencyReplay(
+          const replay = await this.resolveIdempotencyReplay(
+            queryRunner.manager,
             existingTx,
             actorAccountId,
-            expectedPayload,
+            expected,
+          );
+          return {
+            isReplay: true,
+            statusCode: replay.statusCode,
+            transactionResponse: replay.transaction,
+            actorAccountId,
+            destAccountNumber: expected.toAccountNumber,
+          };
+        }
+      }
+
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  private async initiateReversalPhaseA(
+    adminUserId: string,
+    originalTransactionId: string,
+    idempotencyKey: string,
+    reversalDescription: string,
+  ): Promise<PhaseAInitiationResult> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    let adminAccountId: string | null = null;
+    let expectedPayload: ExpectedIdempotencyPayload | null = null;
+
+    try {
+      const adminAccount = await queryRunner.manager.findOne(Account, {
+        where: { user_id: adminUserId },
+        relations: { user: true },
+      });
+      this.validateActorAccount(adminAccount);
+      adminAccountId = adminAccount.id;
+
+      const originalTx = await queryRunner.manager.findOne(Transaction, {
+        where: { id: originalTransactionId },
+        relations: { fromAccount: true, toAccount: true },
+      });
+
+      if (!originalTx) {
+        const existingByKey = await this.findExistingByIdempotencyKey(
+          queryRunner.manager,
+          adminAccountId,
+          idempotencyKey,
+        );
+        if (existingByKey) {
+          throw new ConflictException(
+            'Idempotency-Key đã được sử dụng với nội dung giao dịch khác',
           );
         }
-
-        this.ensureSufficientLockedBalance(actorAccount.balance, dto.amount);
-
-        const balanceAfter = await this.debitAccount(
-          queryRunner.manager,
-          actorAccount.id,
-          dto.amount,
+        throw new NotFoundException(
+          'Không tìm thấy giao dịch gốc cần hoàn tiền',
         );
+      }
 
-        const savedTx = await this.insertTransactionRecord(
+      const reversalFromAccountId = originalTx.to_account_id;
+      const reversalToAccountId = originalTx.from_account_id;
+      const counterpartyAccountNumber =
+        originalTx.fromAccount?.account_number ??
+        originalTx.toAccount?.account_number ??
+        null;
+
+      expectedPayload = {
+        type: TransactionType.REVERSAL,
+        amount: originalTx.amount,
+        description: reversalDescription,
+        toAccountNumber: originalTx.fromAccount?.account_number ?? null,
+        originalTransactionId: originalTx.id,
+      };
+
+      const existingTx = await this.findExistingByIdempotencyKey(
+        queryRunner.manager,
+        adminAccountId,
+        idempotencyKey,
+      );
+      if (existingTx) {
+        await queryRunner.rollbackTransaction();
+        const replay = await this.resolveIdempotencyReplay(
           queryRunner.manager,
-          {
-            actorAccountId: actorAccount.id,
-            fromAccountId: actorAccount.id,
-            toAccountId: null,
-            amount: dto.amount,
-            type: TransactionType.WITHDRAW,
-            description: sanitizedDesc,
-            idempotencyKey,
-          },
-        );
-
-        // Ghi 1 bút toán DEBIT cho giao dịch rút tiền (mô hình một phía)
-        await this.insertLedgerEntries(queryRunner.manager, [
-          {
-            accountId: actorAccount.id,
-            transactionId: savedTx.id,
-            type: LedgerEntryType.DEBIT,
-            amount: savedTx.amount,
-            balanceAfter,
-          },
-        ]);
-
-        await queryRunner.commitTransaction();
-
-        return {
-          isReplay: false,
-          transaction: this.mapTransactionResponse(savedTx, 'outgoing', null),
-        };
-      } catch (error: any) {
-        return await this.handleTransactionError(
-          queryRunner,
-          error,
-          actorAccountId,
-          idempotencyKey,
+          existingTx,
+          adminAccountId,
           expectedPayload,
         );
-      } finally {
-        await queryRunner.release();
+        return {
+          isReplay: true,
+          statusCode: replay.statusCode,
+          transactionResponse: replay.transaction,
+          actorAccountId: adminAccountId,
+          destAccountNumber: counterpartyAccountNumber,
+        };
       }
-    });
+
+      if (originalTx.type === TransactionType.REVERSAL) {
+        throw new ConflictException(
+          'Không thể thực hiện hoàn tiền cho một giao dịch hoàn tiền (REVERSAL)',
+        );
+      }
+      if (originalTx.status !== TransactionStatus.COMPLETED) {
+        throw new ConflictException(
+          `Chỉ có thể hoàn tiền cho giao dịch ở trạng thái COMPLETED (trạng thái hiện tại: ${originalTx.status})`,
+        );
+      }
+
+      const createdReversal = queryRunner.manager.create(Transaction, {
+        actor_account_id: adminAccountId,
+        from_account_id: reversalFromAccountId,
+        to_account_id: reversalToAccountId,
+        original_transaction_id: originalTx.id,
+        amount: originalTx.amount,
+        type: TransactionType.REVERSAL,
+        status: TransactionStatus.INITIATED,
+        failure_code: null,
+        description: reversalDescription,
+        idempotency_key: idempotencyKey,
+      });
+
+      const savedReversal = await queryRunner.manager.save(createdReversal);
+
+      await this.transition(
+        queryRunner.manager,
+        savedReversal.id,
+        TransactionStatus.INITIATED,
+        TransactionStatus.PROCESSING,
+      );
+      savedReversal.status = TransactionStatus.PROCESSING;
+
+      await queryRunner.commitTransaction();
+
+      return {
+        isReplay: false,
+        initiatedTx: savedReversal,
+        actorAccountId: adminAccountId,
+        destAccountNumber: counterpartyAccountNumber,
+      };
+    } catch (error: any) {
+      if (queryRunner.isTransactionActive) {
+        await queryRunner.rollbackTransaction();
+      }
+
+      if (adminAccountId && error?.code === PG_UNIQUE_VIOLATION) {
+        if (expectedPayload) {
+          const existingTx = await this.findExistingByIdempotencyKey(
+            queryRunner.manager,
+            adminAccountId,
+            idempotencyKey,
+          );
+          if (existingTx) {
+            const replay = await this.resolveIdempotencyReplay(
+              queryRunner.manager,
+              existingTx,
+              adminAccountId,
+              expectedPayload,
+            );
+            return {
+              isReplay: true,
+              statusCode: replay.statusCode,
+              transactionResponse: replay.transaction,
+              actorAccountId: adminAccountId,
+              destAccountNumber: expectedPayload.toAccountNumber,
+            };
+          }
+        }
+
+        throw new ConflictException(
+          'Giao dịch này đã được hoàn tiền hoặc đang có yêu cầu hoàn tiền khác xử lý',
+        );
+      }
+
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  private async recordFailedTransactionPhaseC(
+    transactionId: string,
+    failureCode: TransactionFailureCode,
+  ): Promise<void> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      await this.transition(
+        queryRunner.manager,
+        transactionId,
+        TransactionStatus.PROCESSING,
+        TransactionStatus.FAILED,
+        { failureCode },
+      );
+      await queryRunner.commitTransaction();
+    } catch (phaseCError: any) {
+      if (queryRunner.isTransactionActive) {
+        await queryRunner.rollbackTransaction();
+      }
+      this.logger.error(
+        `[PhaseCFailure] Không thể ghi nhận trạng thái FAILED cho giao dịch ${transactionId}: ${phaseCError?.message}`,
+      );
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  private classifyPhaseBFailure(error: any): TransactionFailureCode {
+    if (error instanceof BusinessTransactionError) {
+      return error.failureCode;
+    }
+
+    if (
+      error?.code === PG_LOCK_NOT_AVAILABLE ||
+      error?.code === PG_QUERY_CANCELED ||
+      error?.code === PG_DEADLOCK_DETECTED ||
+      error instanceof ServiceUnavailableException
+    ) {
+      return TransactionFailureCode.SERVER_BUSY;
+    }
+
+    if (error?.code === PG_NUMERIC_OVERFLOW) {
+      return TransactionFailureCode.AMOUNT_OVERFLOW;
+    }
+
+    this.logger.error(
+      `[PhaseBUnexpectedError] Lỗi bất ngờ trong Pha B: ${error?.message || error}`,
+    );
+    return TransactionFailureCode.INTERNAL_ERROR;
+  }
+
+  private throwFailureException(failureCode: TransactionFailureCode): never {
+    const def =
+      FAILURE_CODE_MAP[failureCode] ??
+      FAILURE_CODE_MAP[TransactionFailureCode.INTERNAL_ERROR];
+
+    switch (def.httpStatus) {
+      case HttpStatus.UNPROCESSABLE_ENTITY:
+        throw new UnprocessableEntityException(def.message);
+      case HttpStatus.SERVICE_UNAVAILABLE:
+        throw new ServiceUnavailableException(def.message);
+      default:
+        throw new HttpException(def.message, def.httpStatus);
+    }
+  }
+
+  private async resolveIdempotencyReplay(
+    manager: EntityManager,
+    existingTx: Transaction,
+    actorAccountId: string,
+    expected: ExpectedIdempotencyPayload,
+  ): Promise<{ statusCode: number; transaction: any }> {
+    const isSameType = existingTx.type === expected.type;
+    const isSameAmount =
+      this.parseDecimalToCents(existingTx.amount) ===
+      this.parseDecimalToCents(expected.amount);
+    const isSameDesc =
+      (existingTx.description || null) === (expected.description || null);
+    const existingToAccNum = existingTx.toAccount?.account_number ?? null;
+    const isSameDest =
+      expected.type !== TransactionType.TRANSFER ||
+      existingToAccNum === expected.toAccountNumber;
+    const isSameOrig =
+      expected.type !== TransactionType.REVERSAL ||
+      existingTx.original_transaction_id ===
+        (expected.originalTransactionId ?? null);
+
+    if (
+      !isSameType ||
+      !isSameAmount ||
+      !isSameDesc ||
+      !isSameDest ||
+      !isSameOrig
+    ) {
+      throw new ConflictException(
+        'Idempotency-Key đã được sử dụng với nội dung giao dịch khác',
+      );
+    }
+
+    let reversalTransactionId: string | null = null;
+    if (existingTx.status === TransactionStatus.REVERSED) {
+      const completedRev = await manager.findOne(Transaction, {
+        where: {
+          original_transaction_id: existingTx.id,
+          type: TransactionType.REVERSAL,
+          status: TransactionStatus.COMPLETED,
+        },
+        select: { id: true },
+      });
+      reversalTransactionId = completedRev?.id ?? null;
+    }
+
+    if (
+      existingTx.status === TransactionStatus.COMPLETED ||
+      existingTx.status === TransactionStatus.REVERSED
+    ) {
+      return {
+        statusCode: HttpStatus.OK,
+        transaction: this.mapTransactionItem(
+          existingTx,
+          actorAccountId,
+          reversalTransactionId,
+        ),
+      };
+    }
+
+    if (existingTx.status === TransactionStatus.FAILED) {
+      const code =
+        (existingTx.failure_code as TransactionFailureCode) ||
+        TransactionFailureCode.INTERNAL_ERROR;
+      this.throwFailureException(
+        FAILURE_CODE_MAP[code] ? code : TransactionFailureCode.INTERNAL_ERROR,
+      );
+    }
+
+    return {
+      statusCode: HttpStatus.ACCEPTED,
+      transaction: this.mapTransactionItem(
+        existingTx,
+        actorAccountId,
+        reversalTransactionId,
+      ),
+    };
   }
 
   // =========================================================================
-  // CÁC BƯỚC DÙNG CHUNG & XỬ LÝ DEADLOCK RETRY
+  // CÁC HÀM BƯỚC DÙNG CHUNG TRONG PHA B & DEADLOCK RETRY
   // =========================================================================
 
-  /**
-   * Bọc bên ngoài toàn bộ Database Transaction để tự động thử lại khi gặp Deadlock (40P01).
-   * Mỗi lần retry là một transaction hoàn toàn mới, kèm ghi log và cập nhật bộ đếm.
-   */
   private async executeWithDeadlockRetry<T>(
     txType: TransactionType,
     operation: () => Promise<T>,
@@ -509,17 +1326,15 @@ export class TransactionsService {
             `[DeadlockExhausted] Đã hết ${MAX_DEADLOCK_RETRIES} lần retry cho giao dịch (${txType}) | ` +
               `Counters: ${JSON.stringify(this.deadlockStats)}`,
           );
-          throw new ServiceUnavailableException(
-            'Hệ thống đang bận, vui lòng thử lại',
+          throw new BusinessTransactionError(
+            TransactionFailureCode.SERVER_BUSY,
           );
         }
         throw error;
       }
     }
 
-    throw new ServiceUnavailableException(
-      'Hệ thống đang bận, vui lòng thử lại',
-    );
+    throw new BusinessTransactionError(TransactionFailureCode.SERVER_BUSY);
   }
 
   private async startTransactionWithLockTimeout(): Promise<QueryRunner> {
@@ -549,19 +1364,16 @@ export class TransactionsService {
   private ensureSufficientLockedBalance(
     lockedBalance: string,
     requiredAmount: string,
+    failureCode: TransactionFailureCode = TransactionFailureCode.INSUFFICIENT_BALANCE,
   ): void {
     if (
       this.parseDecimalToCents(lockedBalance) <
       this.parseDecimalToCents(requiredAmount)
     ) {
-      throw new UnprocessableEntityException('Không đủ số dư khả dụng');
+      throw new BusinessTransactionError(failureCode);
     }
   }
 
-  /**
-   * Tải và khóa dòng (SELECT ... FOR UPDATE OF "account") cho tất cả account liên quan
-   * trong MỘT truy vấn duy nhất, sắp xếp theo account.id ASC.
-   */
   private async loadAccountsForTransaction(
     manager: EntityManager,
     userId: string,
@@ -600,20 +1412,17 @@ export class TransactionsService {
     }
   }
 
-  private validateDestinationAccount(
+  private validateDestinationAccountInPhaseB(
     destAccount: Account | null,
     sourceAccount: Account,
   ): Account {
-    if (!destAccount) {
-      throw new NotFoundException('Tài khoản đích không tồn tại');
+    if (!destAccount || sourceAccount.id === destAccount.id) {
+      throw new BusinessTransactionError(TransactionFailureCode.INTERNAL_ERROR);
     }
     if (destAccount.user.status !== UserStatus.ACTIVE) {
-      throw new UnprocessableEntityException(
-        'Tài khoản đích đang bị khóa, không thể nhận tiền',
+      throw new BusinessTransactionError(
+        TransactionFailureCode.DESTINATION_UNAVAILABLE,
       );
-    }
-    if (sourceAccount.id === destAccount.id) {
-      throw new BadRequestException('Không thể tự chuyển tiền cho chính mình');
     }
     return destAccount;
   }
@@ -632,41 +1441,11 @@ export class TransactionsService {
     });
   }
 
-  private resolveIdempotencyReplay(
-    existingTx: Transaction,
-    actorAccountId: string,
-    expected: ExpectedIdempotencyPayload,
-  ) {
-    const isSameType = existingTx.type === expected.type;
-    const isSameAmount =
-      this.parseDecimalToCents(existingTx.amount) ===
-      this.parseDecimalToCents(expected.amount);
-    const isSameDesc =
-      (existingTx.description || null) === (expected.description || null);
-    const existingToAccNum = existingTx.toAccount?.account_number ?? null;
-    const isSameDest =
-      expected.type !== TransactionType.TRANSFER ||
-      existingToAccNum === expected.toAccountNumber;
-
-    if (isSameType && isSameAmount && isSameDesc && isSameDest) {
-      return {
-        isReplay: true,
-        transaction: this.mapTransactionItem(existingTx, actorAccountId),
-      };
-    }
-
-    throw new ConflictException(
-      'Idempotency-Key đã được sử dụng với nội dung giao dịch khác',
-    );
-  }
-
-  /**
-   * Trừ tiền nguyên tử kèm RETURNING balance để lấy số dư ngay sau biến động ghi vào sổ cái.
-   */
   private async debitAccount(
     manager: EntityManager,
     accountId: string,
     amount: string,
+    failureCode: TransactionFailureCode = TransactionFailureCode.INSUFFICIENT_BALANCE,
   ): Promise<string> {
     const debitResult = await manager
       .createQueryBuilder()
@@ -677,15 +1456,12 @@ export class TransactionsService {
       .execute();
 
     if (debitResult.affected === 0 || !debitResult.raw?.[0]?.balance) {
-      throw new UnprocessableEntityException('Không đủ số dư khả dụng');
+      throw new BusinessTransactionError(failureCode);
     }
 
     return String(debitResult.raw[0].balance);
   }
 
-  /**
-   * Cộng tiền nguyên tử kèm RETURNING balance để lấy số dư ngay sau biến động ghi vào sổ cái.
-   */
   private async creditAccount(
     manager: EntityManager,
     accountId: string,
@@ -701,50 +1477,22 @@ export class TransactionsService {
         .execute();
 
       if (creditResult.affected === 0 || !creditResult.raw?.[0]?.balance) {
-        throw new NotFoundException('Không tìm thấy tài khoản nhận tiền');
+        throw new BusinessTransactionError(
+          TransactionFailureCode.INTERNAL_ERROR,
+        );
       }
 
       return String(creditResult.raw[0].balance);
     } catch (error: any) {
-      if (error.code === PG_NUMERIC_OVERFLOW) {
-        throw new UnprocessableEntityException(
-          'Số dư tài khoản vượt quá giới hạn cho phép',
+      if (error?.code === PG_NUMERIC_OVERFLOW) {
+        throw new BusinessTransactionError(
+          TransactionFailureCode.AMOUNT_OVERFLOW,
         );
       }
       throw error;
     }
   }
 
-  private async insertTransactionRecord(
-    manager: EntityManager,
-    params: {
-      actorAccountId: string;
-      fromAccountId: string | null;
-      toAccountId: string | null;
-      amount: string;
-      type: TransactionType;
-      description: string | null;
-      idempotencyKey: string;
-    },
-  ): Promise<Transaction> {
-    const tx = manager.create(Transaction, {
-      actor_account_id: params.actorAccountId,
-      from_account_id: params.fromAccountId,
-      to_account_id: params.toAccountId,
-      amount: params.amount,
-      type: params.type,
-      status: TransactionStatus.SUCCESS,
-      description: params.description,
-      idempotency_key: params.idempotencyKey,
-    });
-
-    return manager.save(tx);
-  }
-
-  /**
-   * Bước ghi bút toán vào bảng chỉ-ghi-thêm ledger_entries trong cùng Database Transaction.
-   * Ghi tuần tự từng bút toán qua EntityManager của transaction để giữ thứ tự id rõ ràng.
-   */
   private async insertLedgerEntries(
     manager: EntityManager,
     entries: LedgerEntryInput[],
@@ -760,59 +1508,11 @@ export class TransactionsService {
     }
   }
 
-  private async handleTransactionError(
-    queryRunner: QueryRunner,
-    error: any,
-    actorAccountId: string | null,
-    idempotencyKey: string,
-    expectedPayload: ExpectedIdempotencyPayload,
-  ): Promise<never | { isReplay: boolean; transaction: any }> {
-    if (queryRunner.isTransactionActive) {
-      await queryRunner.rollbackTransaction();
-    }
-
-    // Nếu là Deadlock (40P01) -> ném ra ngoài để executeWithDeadlockRetry bắt và thử lại
-    if (error.code === PG_DEADLOCK_DETECTED) {
-      throw error;
-    }
-
-    // Bắt lỗi hết thời gian chờ khóa (55P03: lock_not_available) -> trả 503 thân thiện
-    if (
-      error.code === PG_LOCK_NOT_AVAILABLE ||
-      error.code === PG_QUERY_CANCELED
-    ) {
-      throw new ServiceUnavailableException(
-        'Hệ thống đang bận, vui lòng thử lại',
-      );
-    }
-
-    if (actorAccountId && error.code === PG_UNIQUE_VIOLATION) {
-      const existingTx = await this.findExistingByIdempotencyKey(
-        queryRunner.manager,
-        actorAccountId,
-        idempotencyKey,
-      );
-
-      if (existingTx) {
-        return this.resolveIdempotencyReplay(
-          existingTx,
-          actorAccountId,
-          expectedPayload,
-        );
-      }
-    }
-
-    if (error.status) {
-      throw error;
-    }
-
-    console.error('Transaction Error:', error);
-    throw new InternalServerErrorException(
-      'Lỗi hệ thống khi thực hiện giao dịch',
-    );
-  }
-
-  private mapTransactionItem(tx: Transaction, currentAccountId: string) {
+  private mapTransactionItem(
+    tx: Transaction,
+    currentAccountId: string,
+    reversalTransactionId: string | null = null,
+  ) {
     const isIncoming = tx.to_account_id === currentAccountId;
     const counterpartyAccountNumber = isIncoming
       ? (tx.fromAccount?.account_number ?? null)
@@ -822,6 +1522,7 @@ export class TransactionsService {
       tx,
       isIncoming ? 'incoming' : 'outgoing',
       counterpartyAccountNumber,
+      reversalTransactionId,
     );
   }
 
@@ -829,6 +1530,7 @@ export class TransactionsService {
     tx: Transaction,
     direction: 'incoming' | 'outgoing',
     counterpartyAccountNumber: string | null,
+    reversalTransactionId: string | null = null,
   ) {
     return {
       id: tx.id,
@@ -839,6 +1541,8 @@ export class TransactionsService {
       createdAt: tx.created_at,
       direction,
       counterpartyAccountNumber,
+      originalTransactionId: tx.original_transaction_id ?? null,
+      reversalTransactionId,
     };
   }
 }

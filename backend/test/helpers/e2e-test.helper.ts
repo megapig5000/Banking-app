@@ -5,6 +5,7 @@ import { App } from 'supertest/types';
 import { DataSource } from 'typeorm';
 import { randomUUID } from 'node:crypto';
 import { AppModule } from '../../src/app.module';
+import { User, UserRole } from '../../src/database/entities/user.entity';
 
 export interface TestAccountContext {
   userId: string;
@@ -52,7 +53,6 @@ export async function createTestApp(): Promise<{
 
 /**
  * Làm sạch dữ liệu giữa các bài test để mỗi test độc lập hoàn toàn.
- * Lưu ý: Trigger BEFORE UPDATE OR DELETE mức dòng trên ledger_entries không chặn TRUNCATE.
  */
 export async function resetDatabase(dataSource: DataSource): Promise<void> {
   await dataSource.query(
@@ -61,30 +61,32 @@ export async function resetDatabase(dataSource: DataSource): Promise<void> {
 }
 
 /**
- * Kiểm tra cả 3 bất biến sổ cái kép (Q1, Q2, Q3).
- * Kỳ vọng cả 3 truy vấn đều trả về 0 dòng sai lệch.
+ * Kiểm tra bộ 5 bất biến sổ cái kép & vòng đời giao dịch (Q1', Q2, Q3, Q4, Q5).
+ * Kỳ vọng tất cả truy vấn đều trả về 0 dòng sai lệch.
  */
 export async function assertLedgerInvariants(
   dataSource: DataSource,
 ): Promise<void> {
-  // Q1 — Mỗi giao dịch success có đúng số lượng bút toán, đủ và cân bằng
+  // Q1' — Bút toán đúng theo loại và trạng thái (chưa/không hoàn tất thì 0 bút toán; COMPLETED/REVERSED đủ và cân)
   const q1Violations = await dataSource.query(`
-    SELECT t.id, t.type
+    SELECT t.id, t.type, t.status
     FROM "transactions" t
     LEFT JOIN "ledger_entries" le ON le.transaction_id = t.id
-    WHERE t.status = 'success'
-    GROUP BY t.id, t.type, t.amount
-    HAVING CASE t.type
-      WHEN 'transfer' THEN
+    GROUP BY t.id, t.type, t.status, t.amount, t.original_transaction_id
+    HAVING CASE
+      WHEN t.status NOT IN ('COMPLETED', 'REVERSED') THEN COUNT(le.id) <> 0
+      WHEN t.type = 'TRANSFER' THEN
            COUNT(le.id) <> 2
         OR COALESCE(SUM(le.amount) FILTER (WHERE le.type = 'DEBIT'), 0)  <> t.amount
         OR COALESCE(SUM(le.amount) FILTER (WHERE le.type = 'CREDIT'), 0) <> t.amount
-      WHEN 'deposit' THEN
+      WHEN t.type = 'DEPOSIT' THEN
            COUNT(le.id) <> 1
         OR COALESCE(SUM(le.amount) FILTER (WHERE le.type = 'CREDIT'), 0) <> t.amount
-      WHEN 'withdraw' THEN
+      WHEN t.type = 'WITHDRAW' THEN
            COUNT(le.id) <> 1
         OR COALESCE(SUM(le.amount) FILTER (WHERE le.type = 'DEBIT'), 0) <> t.amount
+      WHEN t.type = 'REVERSAL' THEN
+           COUNT(le.id) <> (SELECT COUNT(*) FROM "ledger_entries" o WHERE o.transaction_id = t.original_transaction_id)
     END
   `);
   expect(q1Violations).toEqual([]);
@@ -112,6 +114,31 @@ export async function assertLedgerInvariants(
     WHERE x.balance_after <> x.running
   `);
   expect(q3Violations).toEqual([]);
+
+  // Q4 — Mỗi cặp (gốc, hoàn tiền COMPLETED) triệt tiêu nhau trên từng tài khoản
+  const q4Violations = await dataSource.query(`
+    SELECT o.id AS original_id, le.account_id,
+           SUM(CASE le.type WHEN 'CREDIT' THEN le.amount ELSE -le.amount END) AS net
+    FROM "transactions" o
+    JOIN "transactions" r ON r.original_transaction_id = o.id AND r.type = 'REVERSAL' AND r.status = 'COMPLETED'
+    JOIN "ledger_entries" le ON le.transaction_id IN (o.id, r.id)
+    GROUP BY o.id, le.account_id
+    HAVING SUM(CASE le.type WHEN 'CREDIT' THEN le.amount ELSE -le.amount END) <> 0
+  `);
+  expect(q4Violations).toEqual([]);
+
+  // Q5 — Trạng thái của giao dịch gốc (REVERSED) và giao dịch hoàn tiền (REVERSAL COMPLETED) nhất quán
+  const q5Violations = await dataSource.query(`
+    SELECT o.id FROM "transactions" o
+    WHERE o.status = 'REVERSED'
+      AND (SELECT COUNT(*) FROM "transactions" r
+           WHERE r.original_transaction_id = o.id AND r.type = 'REVERSAL' AND r.status = 'COMPLETED') <> 1
+    UNION ALL
+    SELECT r.id FROM "transactions" r
+    WHERE r.type = 'REVERSAL' AND r.status = 'COMPLETED'
+      AND NOT EXISTS (SELECT 1 FROM "transactions" o WHERE o.id = r.original_transaction_id AND o.status = 'REVERSED')
+  `);
+  expect(q5Violations).toEqual([]);
 }
 
 /**
@@ -172,4 +199,19 @@ export async function createAuthenticatedAccount(
     accountNumber: meRes.body.accountNumber,
     balance: meRes.body.balance,
   };
+}
+
+/**
+ * Helper tạo nhanh 1 tài khoản Admin (role = UserRole.ADMIN) phục vụ test hoàn tiền REVERSAL
+ */
+export async function createAuthenticatedAdmin(
+  app: INestApplication<App>,
+  dataSource: DataSource,
+  label = 'Admin',
+): Promise<TestAccountContext> {
+  const ctx = await createAuthenticatedAccount(app, label);
+  await dataSource
+    .getRepository(User)
+    .update({ id: ctx.userId }, { role: UserRole.ADMIN });
+  return ctx;
 }

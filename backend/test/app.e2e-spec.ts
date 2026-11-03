@@ -70,7 +70,8 @@ describe('Simple Banking App Smoke (e2e)', () => {
       })
       .expect(201);
 
-    expect(depositRes.body.type).toBe('deposit');
+    expect(depositRes.body.type).toBe('DEPOSIT');
+    expect(depositRes.body.status).toBe('COMPLETED');
     expect(depositRes.body.direction).toBe('incoming');
     expect(depositRes.body.amount).toBe('250000.00');
     expect(depositRes.body.counterpartyAccountNumber).toBeNull();
