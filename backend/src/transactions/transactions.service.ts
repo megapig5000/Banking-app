@@ -10,6 +10,7 @@ import {
   HttpException,
   HttpStatus,
 } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
 import {
   DataSource,
@@ -53,6 +54,7 @@ import {
   PG_UNIQUE_VIOLATION,
   RETRY_DELAY_MAX_MS,
   RETRY_DELAY_MIN_MS,
+  STUCK_AFTER_SECONDS,
   TransactionFailureCode,
 } from './transactions.constants';
 
@@ -85,6 +87,12 @@ export interface DeadlockStats {
   deadlockDetected: number;
   retrySucceeded: number;
   retryExhausted: number;
+}
+
+export interface SweepStuckResult {
+  sweptCount: number;
+  skippedWithLedgerCount: number;
+  sweptIds: string[];
 }
 
 /**
@@ -168,6 +176,92 @@ export class TransactionsService {
   }
 
   // =========================================================================
+  // JOB QUÉT GIAO DỊCH TREO (STUCK TRANSACTIONS SWEEP - BÀI 5.3)
+  // =========================================================================
+
+  /**
+   * Cron job tự động chạy mỗi phút để phát hiện và đóng dấu FAILED (TIMEOUT) cho các giao dịch treo.
+   * Trong môi trường test (NODE_ENV === 'test'), tắt lịch tự chạy để test chủ động gọi sweepStuckTransactions().
+   */
+  @Cron(CronExpression.EVERY_MINUTE)
+  async handleStuckTransactionsCron(): Promise<void> {
+    if (process.env.NODE_ENV === 'test') {
+      return;
+    }
+    await this.sweepStuckTransactions();
+  }
+
+  /**
+   * Tìm các giao dịch PROCESSING có updated_at cũ hơn STUCK_AFTER_SECONDS (mặc định 120s):
+   * - Nếu chưa có bút toán nào trong ledger_entries: chuyển sang FAILED (failure_code = TIMEOUT) và log WARN.
+   * - Nếu đã có bút toán trong ledger_entries (bất thường trái thiết kế): log ERROR và giữ nguyên để xử lý thủ công.
+   */
+  async sweepStuckTransactions(
+    stuckAfterSeconds: number = STUCK_AFTER_SECONDS,
+  ): Promise<SweepStuckResult> {
+    const candidates: Array<{
+      id: string;
+      type: TransactionType;
+      ledger_count: string;
+    }> = await this.dataSource.query(
+      `
+      SELECT t.id,
+             t.type,
+             COUNT(le.id)::text AS ledger_count
+      FROM "transactions" t
+      LEFT JOIN "ledger_entries" le ON le.transaction_id = t.id
+      WHERE t.status = 'PROCESSING'
+        AND t.updated_at < NOW() - ($1 * INTERVAL '1 second')
+      GROUP BY t.id, t.type, t.updated_at
+      ORDER BY t.updated_at ASC
+      `,
+      [stuckAfterSeconds],
+    );
+
+    let sweptCount = 0;
+    let skippedWithLedgerCount = 0;
+    const sweptIds: string[] = [];
+
+    for (const candidate of candidates) {
+      const ledgerCount = parseInt(candidate.ledger_count, 10);
+
+      if (ledgerCount > 0) {
+        skippedWithLedgerCount += 1;
+        this.logger.error(
+          `[StuckSweepAnomaly] Phát hiện giao dịch PROCESSING (${candidate.id}, type=${candidate.type}) ` +
+            `đã có ${ledgerCount} bút toán trong sổ cái! Không tự động đổi trạng thái để bảo toàn dữ liệu.`,
+        );
+        continue;
+      }
+
+      try {
+        await this.transition(
+          this.dataSource.manager,
+          candidate.id,
+          TransactionStatus.PROCESSING,
+          TransactionStatus.FAILED,
+          { failureCode: TransactionFailureCode.TIMEOUT },
+        );
+        sweptCount += 1;
+        sweptIds.push(candidate.id);
+        this.logger.warn(
+          `[StuckTransactionSwept] Đã đánh dấu FAILED (TIMEOUT) cho giao dịch treo: id=${candidate.id}, type=${candidate.type}`,
+        );
+      } catch {
+        // Nếu ngay lúc quét mà giao dịch vừa được Pha B chuyển sang COMPLETED/FAILED thì bỏ qua an toàn
+      }
+    }
+
+    if (sweptCount > 0 || skippedWithLedgerCount > 0) {
+      this.logger.warn(
+        `[StuckSweepSummary] Hoàn tất quét giao dịch treo: swept=${sweptCount}, anomalySkipped=${skippedWithLedgerCount}`,
+      );
+    }
+
+    return { sweptCount, skippedWithLedgerCount, sweptIds };
+  }
+
+  // =========================================================================
   // LỊCH SỬ GIAO DỊCH (CÓ originalTransactionId & reversalTransactionId)
   // =========================================================================
 
@@ -231,7 +325,6 @@ export class TransactionsService {
 
     const [transactions, total] = await qb.getManyAndCount();
 
-    // Tải reversalTransactionId cho các giao dịch REVERSED trong trang hiện tại chỉ bằng 1 truy vấn
     const reversedIds = transactions
       .filter((tx) => tx.status === TransactionStatus.REVERSED)
       .map((tx) => tx.id);
@@ -577,15 +670,6 @@ export class TransactionsService {
     }
   }
 
-  /**
-   * Nghiệp vụ Hoàn tiền (REVERSAL - Bài 3.2) dành cho Admin, thực thi theo Luồng 3 Pha:
-   * - Pha A: Kiểm tra Idempotency, kiểm tra giao dịch gốc phải là COMPLETED (không phải REVERSAL),
-   *   tạo phiếu REVERSAL (INITIATED -> PROCESSING) với chiều tài khoản đảo ngược và COMMIT.
-   * - Pha B: Khóa các tài khoản liên quan theo id ASC, đọc bút toán gốc và tạo các bút toán đảo (DEBIT <-> CREDIT),
-   *   đóng dấu REVERSAL (PROCESSING -> COMPLETED) VÀ đóng dấu giao dịch gốc (COMPLETED -> REVERSED) trong cùng 1 transaction.
-   * - Pha C: Nếu Pha B lỗi (ví dụ bên nhận đã tiêu hết tiền -> REVERSAL_INSUFFICIENT_BALANCE),
-   *   đóng dấu phiếu REVERSAL sang FAILED, giao dịch gốc giữ nguyên COMPLETED.
-   */
   async reverseTransaction(
     adminUserId: string,
     originalTransactionId: string,
@@ -600,7 +684,6 @@ export class TransactionsService {
         )
       : `Hoàn tiền giao dịch ${originalTransactionId}`;
 
-    // PHA A: Tạo phiếu REVERSAL (hoặc trả về Replay / 409)
     const phaseA = await this.initiateReversalPhaseA(
       adminUserId,
       originalTransactionId,
@@ -616,14 +699,12 @@ export class TransactionsService {
 
     const reversalTx = phaseA.initiatedTx!;
 
-    // PHA B: Đảo biến động số dư, ghi bút toán đảo và đóng dấu cả 2 giao dịch trong 1 transaction
     try {
       const completedReversal = await this.executeWithDeadlockRetry(
         TransactionType.REVERSAL,
         async () => {
           const queryRunner = await this.startTransactionWithLockTimeout();
           try {
-            // 1. Tải các bút toán của giao dịch gốc để biết chính xác từng tài khoản cần đảo
             const originalEntries = await queryRunner.manager.find(
               LedgerEntry,
               {
@@ -638,8 +719,6 @@ export class TransactionsService {
               );
             }
 
-            // 2. Khóa tất cả tài khoản liên quan theo thứ tự account.id ASC (chống Deadlock)
-            // Lưu ý: Không kiểm tra trạng thái LOCKED của chủ tài khoản vì đây là thao tác hoàn tiền của Admin
             const accountIdsToLock = Array.from(
               new Set(originalEntries.map((e) => e.account_id)),
             );
@@ -653,7 +732,6 @@ export class TransactionsService {
 
             const accountMap = new Map(lockedAccounts.map((a) => [a.id, a]));
 
-            // 3. Kiểm tra trước số dư trên các tài khoản cần bị trừ tiền (tức các dòng gốc là CREDIT)
             for (const origEntry of originalEntries) {
               if (origEntry.type === LedgerEntryType.CREDIT) {
                 const targetAcc = accountMap.get(origEntry.account_id);
@@ -670,13 +748,10 @@ export class TransactionsService {
               }
             }
 
-            // 4. Thực hiện trừ tiền (cho các dòng gốc là CREDIT) và cộng tiền (cho các dòng gốc là DEBIT)
-            // theo đúng thứ tự đảo ngược bút toán
             const inverseEntriesToInsert: LedgerEntryInput[] = [];
 
             for (const origEntry of originalEntries) {
               if (origEntry.type === LedgerEntryType.CREDIT) {
-                // Gốc là CREDIT -> Hoàn tiền là DEBIT (trừ lại tiền)
                 const balanceAfter = await this.debitAccount(
                   queryRunner.manager,
                   origEntry.account_id,
@@ -691,7 +766,6 @@ export class TransactionsService {
                   balanceAfter,
                 });
               } else {
-                // Gốc là DEBIT -> Hoàn tiền là CREDIT (cộng trả lại tiền)
                 const balanceAfter = await this.creditAccount(
                   queryRunner.manager,
                   origEntry.account_id,
@@ -707,13 +781,11 @@ export class TransactionsService {
               }
             }
 
-            // 5. Ghi các bút toán đảo vào bảng ledger_entries
             await this.insertLedgerEntries(
               queryRunner.manager,
               inverseEntriesToInsert,
             );
 
-            // 6. Đóng dấu phiếu hoàn tiền: PROCESSING -> COMPLETED
             await this.transition(
               queryRunner.manager,
               reversalTx.id,
@@ -721,7 +793,6 @@ export class TransactionsService {
               TransactionStatus.COMPLETED,
             );
 
-            // 7. Đóng dấu có điều kiện lên giao dịch gốc: COMPLETED -> REVERSED (Lớp bảo vệ thứ 3 chống hoàn tiền 2 lần)
             await this.transition(
               queryRunner.manager,
               originalTransactionId,
@@ -754,7 +825,6 @@ export class TransactionsService {
         ),
       };
     } catch (phaseBError: any) {
-      // Nếu lỗi là ConflictException do giao dịch gốc không còn ở trạng thái COMPLETED -> ghi nhận FAILED rồi ném 409
       if (phaseBError instanceof ConflictException) {
         await this.recordFailedTransactionPhaseC(
           reversalTx.id,
@@ -906,11 +976,6 @@ export class TransactionsService {
     }
   }
 
-  /**
-   * PHA A dành riêng cho nghiệp vụ Hoàn tiền (REVERSAL):
-   * Kiểm tra Idempotency-Key của Admin, kiểm tra tính hợp lệ của giao dịch gốc,
-   * và xử lý cả trường hợp đụng Partial Unique Index `IDX_transactions_active_reversal_original`.
-   */
   private async initiateReversalPhaseA(
     adminUserId: string,
     originalTransactionId: string,
@@ -932,13 +997,11 @@ export class TransactionsService {
       this.validateActorAccount(adminAccount);
       adminAccountId = adminAccount.id;
 
-      // 1. Tải giao dịch gốc để lấy thông tin đối chiếu
       const originalTx = await queryRunner.manager.findOne(Transaction, {
         where: { id: originalTransactionId },
         relations: { fromAccount: true, toAccount: true },
       });
 
-      // Nếu không tìm thấy giao dịch gốc, vẫn kiểm tra xem Idempotency-Key này đã dùng cho giao dịch khác chưa
       if (!originalTx) {
         const existingByKey = await this.findExistingByIdempotencyKey(
           queryRunner.manager,
@@ -955,7 +1018,6 @@ export class TransactionsService {
         );
       }
 
-      // Đảo chiều tài khoản: from của gốc thành to của REVERSAL, to của gốc thành from của REVERSAL
       const reversalFromAccountId = originalTx.to_account_id;
       const reversalToAccountId = originalTx.from_account_id;
       const counterpartyAccountNumber =
@@ -971,8 +1033,6 @@ export class TransactionsService {
         originalTransactionId: originalTx.id,
       };
 
-      // 2. Kiểm tra Idempotency-Key của Admin trước khi kiểm tra trạng thái COMPLETED của gốc
-      // (để nếu giao dịch đã hoàn tiền xong, gửi lại cùng key sẽ trả 200 Replay thay vì báo 409)
       const existingTx = await this.findExistingByIdempotencyKey(
         queryRunner.manager,
         adminAccountId,
@@ -995,7 +1055,6 @@ export class TransactionsService {
         };
       }
 
-      // 3. Lớp bảo vệ 1: Chỉ cho phép hoàn tiền giao dịch ở trạng thái COMPLETED và không phải là REVERSAL
       if (originalTx.type === TransactionType.REVERSAL) {
         throw new ConflictException(
           'Không thể thực hiện hoàn tiền cho một giao dịch hoàn tiền (REVERSAL)',
@@ -1007,7 +1066,6 @@ export class TransactionsService {
         );
       }
 
-      // 4. Tạo bản ghi REVERSAL ở trạng thái INITIATED -> PROCESSING
       const createdReversal = queryRunner.manager.create(Transaction, {
         actor_account_id: adminAccountId,
         from_account_id: reversalFromAccountId,
@@ -1045,7 +1103,6 @@ export class TransactionsService {
       }
 
       if (adminAccountId && error?.code === PG_UNIQUE_VIOLATION) {
-        // Trường hợp 1: Trùng (idempotency_key, actor_account_id) -> trả về Replay (hoặc 409 nếu khác payload)
         if (expectedPayload) {
           const existingTx = await this.findExistingByIdempotencyKey(
             queryRunner.manager,
@@ -1069,8 +1126,6 @@ export class TransactionsService {
           }
         }
 
-        // Trường hợp 2: Đụng Partial Unique Index IDX_transactions_active_reversal_original
-        // (Có một request hoàn tiền khác với key khác cho cùng giao dịch gốc đã/đang chạy) -> 409 Conflict!
         throw new ConflictException(
           'Giao dịch này đã được hoàn tiền hoặc đang có yêu cầu hoàn tiền khác xử lý',
         );
