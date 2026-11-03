@@ -4,7 +4,6 @@ import {
   BadRequestException,
   NotFoundException,
   UnprocessableEntityException,
-  InternalServerErrorException,
   ConflictException,
   ForbiddenException,
   ServiceUnavailableException,
@@ -12,7 +11,13 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, QueryRunner, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  In,
+  QueryRunner,
+  Repository,
+} from 'typeorm';
 import { Account } from '../database/entities/account.entity';
 import {
   Transaction,
@@ -26,6 +31,7 @@ import {
 import { UserStatus } from '../database/entities/user.entity';
 import { TransferDto } from './dto/transfer.dto';
 import { CashTransactionDto } from './dto/cash-transaction.dto';
+import { ReverseTransactionDto } from './dto/reverse-transaction.dto';
 import {
   TransactionQueryDto,
   TransactionDirection,
@@ -162,7 +168,7 @@ export class TransactionsService {
   }
 
   // =========================================================================
-  // LỊCH SỬ GIAO DỊCH
+  // LỊCH SỬ GIAO DỊCH (CÓ originalTransactionId & reversalTransactionId)
   // =========================================================================
 
   async getTransactions(userId: string, query: TransactionQueryDto) {
@@ -225,8 +231,30 @@ export class TransactionsService {
 
     const [transactions, total] = await qb.getManyAndCount();
 
+    // Tải reversalTransactionId cho các giao dịch REVERSED trong trang hiện tại chỉ bằng 1 truy vấn
+    const reversedIds = transactions
+      .filter((tx) => tx.status === TransactionStatus.REVERSED)
+      .map((tx) => tx.id);
+
+    const reversalMap = new Map<string, string>();
+    if (reversedIds.length > 0) {
+      const completedReversals = await this.transactionRepository.find({
+        where: {
+          original_transaction_id: In(reversedIds),
+          type: TransactionType.REVERSAL,
+          status: TransactionStatus.COMPLETED,
+        },
+        select: { id: true, original_transaction_id: true },
+      });
+      for (const rev of completedReversals) {
+        if (rev.original_transaction_id) {
+          reversalMap.set(rev.original_transaction_id, rev.id);
+        }
+      }
+    }
+
     const data = transactions.map((tx) =>
-      this.mapTransactionItem(tx, accountId),
+      this.mapTransactionItem(tx, accountId, reversalMap.get(tx.id) ?? null),
     );
 
     return {
@@ -241,7 +269,7 @@ export class TransactionsService {
   }
 
   // =========================================================================
-  // 3 NGHIỆP VỤ GIAO DỊCH THEO LUỒNG 3 PHA (PHA A -> PHA B -> PHA C)
+  // 4 NGHIỆP VỤ GIAO DỊCH THEO LUỒNG 3 PHA (TRANSFER, DEPOSIT, WITHDRAW, REVERSAL)
   // =========================================================================
 
   async transfer(userId: string, idempotencyKey: string, dto: TransferDto) {
@@ -254,7 +282,6 @@ export class TransactionsService {
       toAccountNumber: dto.toAccountNumber,
     };
 
-    // PHA A: Kiểm tra đầu vào, tra Idempotency, tạo phiếu INITIATED -> PROCESSING và COMMIT ngay
     const phaseA = await this.initiateTransactionPhaseA(
       userId,
       idempotencyKey,
@@ -269,7 +296,6 @@ export class TransactionsService {
 
     const initiatedTx = phaseA.initiatedTx!;
 
-    // PHA B: Xử lý biến động số dư, ghi sổ cái và đóng dấu PROCESSING -> COMPLETED trong 1 transaction
     try {
       const completedTx = await this.executeWithDeadlockRetry(
         TransactionType.TRANSFER,
@@ -321,7 +347,6 @@ export class TransactionsService {
               },
             ]);
 
-            // Đóng dấu PROCESSING -> COMPLETED ngay trong cùng transaction với việc chuyển tiền
             await this.transition(
               queryRunner.manager,
               initiatedTx.id,
@@ -350,10 +375,10 @@ export class TransactionsService {
           completedTx,
           'outgoing',
           phaseA.destAccountNumber,
+          null,
         ),
       };
     } catch (phaseBError: any) {
-      // PHA C: Sau khi Pha B đã rollback, mở transaction ngắn ghi nhận PROCESSING -> FAILED kèm failure_code
       const failureCode = this.classifyPhaseBFailure(phaseBError);
       await this.recordFailedTransactionPhaseC(initiatedTx.id, failureCode);
       this.throwFailureException(failureCode);
@@ -374,7 +399,6 @@ export class TransactionsService {
       toAccountNumber: null,
     };
 
-    // PHA A
     const phaseA = await this.initiateTransactionPhaseA(
       userId,
       idempotencyKey,
@@ -389,7 +413,6 @@ export class TransactionsService {
 
     const initiatedTx = phaseA.initiatedTx!;
 
-    // PHA B
     try {
       const completedTx = await this.executeWithDeadlockRetry(
         TransactionType.DEPOSIT,
@@ -442,10 +465,14 @@ export class TransactionsService {
 
       return {
         statusCode: HttpStatus.CREATED,
-        transaction: this.mapTransactionResponse(completedTx, 'incoming', null),
+        transaction: this.mapTransactionResponse(
+          completedTx,
+          'incoming',
+          null,
+          null,
+        ),
       };
     } catch (phaseBError: any) {
-      // PHA C
       const failureCode = this.classifyPhaseBFailure(phaseBError);
       await this.recordFailedTransactionPhaseC(initiatedTx.id, failureCode);
       this.throwFailureException(failureCode);
@@ -466,7 +493,6 @@ export class TransactionsService {
       toAccountNumber: null,
     };
 
-    // PHA A
     const phaseA = await this.initiateTransactionPhaseA(
       userId,
       idempotencyKey,
@@ -481,7 +507,6 @@ export class TransactionsService {
 
     const initiatedTx = phaseA.initiatedTx!;
 
-    // PHA B
     try {
       const completedTx = await this.executeWithDeadlockRetry(
         TransactionType.WITHDRAW,
@@ -538,12 +563,208 @@ export class TransactionsService {
 
       return {
         statusCode: HttpStatus.CREATED,
-        transaction: this.mapTransactionResponse(completedTx, 'outgoing', null),
+        transaction: this.mapTransactionResponse(
+          completedTx,
+          'outgoing',
+          null,
+          null,
+        ),
       };
     } catch (phaseBError: any) {
-      // PHA C
       const failureCode = this.classifyPhaseBFailure(phaseBError);
       await this.recordFailedTransactionPhaseC(initiatedTx.id, failureCode);
+      this.throwFailureException(failureCode);
+    }
+  }
+
+  /**
+   * Nghiệp vụ Hoàn tiền (REVERSAL - Bài 3.2) dành cho Admin, thực thi theo Luồng 3 Pha:
+   * - Pha A: Kiểm tra Idempotency, kiểm tra giao dịch gốc phải là COMPLETED (không phải REVERSAL),
+   *   tạo phiếu REVERSAL (INITIATED -> PROCESSING) với chiều tài khoản đảo ngược và COMMIT.
+   * - Pha B: Khóa các tài khoản liên quan theo id ASC, đọc bút toán gốc và tạo các bút toán đảo (DEBIT <-> CREDIT),
+   *   đóng dấu REVERSAL (PROCESSING -> COMPLETED) VÀ đóng dấu giao dịch gốc (COMPLETED -> REVERSED) trong cùng 1 transaction.
+   * - Pha C: Nếu Pha B lỗi (ví dụ bên nhận đã tiêu hết tiền -> REVERSAL_INSUFFICIENT_BALANCE),
+   *   đóng dấu phiếu REVERSAL sang FAILED, giao dịch gốc giữ nguyên COMPLETED.
+   */
+  async reverseTransaction(
+    adminUserId: string,
+    originalTransactionId: string,
+    idempotencyKey: string,
+    dto: ReverseTransactionDto,
+  ) {
+    const sanitizedReason = sanitizeHtml(dto.reason?.trim() || '') || null;
+    const reversalDescription = sanitizedReason
+      ? `Hoàn tiền giao dịch ${originalTransactionId}: ${sanitizedReason}`.slice(
+          0,
+          255,
+        )
+      : `Hoàn tiền giao dịch ${originalTransactionId}`;
+
+    // PHA A: Tạo phiếu REVERSAL (hoặc trả về Replay / 409)
+    const phaseA = await this.initiateReversalPhaseA(
+      adminUserId,
+      originalTransactionId,
+      idempotencyKey,
+      reversalDescription,
+    );
+    if (phaseA.isReplay) {
+      return {
+        statusCode: phaseA.statusCode!,
+        transaction: phaseA.transactionResponse,
+      };
+    }
+
+    const reversalTx = phaseA.initiatedTx!;
+
+    // PHA B: Đảo biến động số dư, ghi bút toán đảo và đóng dấu cả 2 giao dịch trong 1 transaction
+    try {
+      const completedReversal = await this.executeWithDeadlockRetry(
+        TransactionType.REVERSAL,
+        async () => {
+          const queryRunner = await this.startTransactionWithLockTimeout();
+          try {
+            // 1. Tải các bút toán của giao dịch gốc để biết chính xác từng tài khoản cần đảo
+            const originalEntries = await queryRunner.manager.find(
+              LedgerEntry,
+              {
+                where: { transaction_id: originalTransactionId },
+                order: { id: 'ASC' },
+              },
+            );
+
+            if (originalEntries.length === 0) {
+              throw new BusinessTransactionError(
+                TransactionFailureCode.INTERNAL_ERROR,
+              );
+            }
+
+            // 2. Khóa tất cả tài khoản liên quan theo thứ tự account.id ASC (chống Deadlock)
+            // Lưu ý: Không kiểm tra trạng thái LOCKED của chủ tài khoản vì đây là thao tác hoàn tiền của Admin
+            const accountIdsToLock = Array.from(
+              new Set(originalEntries.map((e) => e.account_id)),
+            );
+
+            const lockedAccounts = await queryRunner.manager
+              .createQueryBuilder(Account, 'account')
+              .setLock('pessimistic_write', undefined, ['account'])
+              .where('account.id IN (:...ids)', { ids: accountIdsToLock })
+              .orderBy('account.id', 'ASC')
+              .getMany();
+
+            const accountMap = new Map(lockedAccounts.map((a) => [a.id, a]));
+
+            // 3. Kiểm tra trước số dư trên các tài khoản cần bị trừ tiền (tức các dòng gốc là CREDIT)
+            for (const origEntry of originalEntries) {
+              if (origEntry.type === LedgerEntryType.CREDIT) {
+                const targetAcc = accountMap.get(origEntry.account_id);
+                if (!targetAcc) {
+                  throw new BusinessTransactionError(
+                    TransactionFailureCode.INTERNAL_ERROR,
+                  );
+                }
+                this.ensureSufficientLockedBalance(
+                  targetAcc.balance,
+                  origEntry.amount,
+                  TransactionFailureCode.REVERSAL_INSUFFICIENT_BALANCE,
+                );
+              }
+            }
+
+            // 4. Thực hiện trừ tiền (cho các dòng gốc là CREDIT) và cộng tiền (cho các dòng gốc là DEBIT)
+            // theo đúng thứ tự đảo ngược bút toán
+            const inverseEntriesToInsert: LedgerEntryInput[] = [];
+
+            for (const origEntry of originalEntries) {
+              if (origEntry.type === LedgerEntryType.CREDIT) {
+                // Gốc là CREDIT -> Hoàn tiền là DEBIT (trừ lại tiền)
+                const balanceAfter = await this.debitAccount(
+                  queryRunner.manager,
+                  origEntry.account_id,
+                  origEntry.amount,
+                  TransactionFailureCode.REVERSAL_INSUFFICIENT_BALANCE,
+                );
+                inverseEntriesToInsert.push({
+                  accountId: origEntry.account_id,
+                  transactionId: reversalTx.id,
+                  type: LedgerEntryType.DEBIT,
+                  amount: origEntry.amount,
+                  balanceAfter,
+                });
+              } else {
+                // Gốc là DEBIT -> Hoàn tiền là CREDIT (cộng trả lại tiền)
+                const balanceAfter = await this.creditAccount(
+                  queryRunner.manager,
+                  origEntry.account_id,
+                  origEntry.amount,
+                );
+                inverseEntriesToInsert.push({
+                  accountId: origEntry.account_id,
+                  transactionId: reversalTx.id,
+                  type: LedgerEntryType.CREDIT,
+                  amount: origEntry.amount,
+                  balanceAfter,
+                });
+              }
+            }
+
+            // 5. Ghi các bút toán đảo vào bảng ledger_entries
+            await this.insertLedgerEntries(
+              queryRunner.manager,
+              inverseEntriesToInsert,
+            );
+
+            // 6. Đóng dấu phiếu hoàn tiền: PROCESSING -> COMPLETED
+            await this.transition(
+              queryRunner.manager,
+              reversalTx.id,
+              TransactionStatus.PROCESSING,
+              TransactionStatus.COMPLETED,
+            );
+
+            // 7. Đóng dấu có điều kiện lên giao dịch gốc: COMPLETED -> REVERSED (Lớp bảo vệ thứ 3 chống hoàn tiền 2 lần)
+            await this.transition(
+              queryRunner.manager,
+              originalTransactionId,
+              TransactionStatus.COMPLETED,
+              TransactionStatus.REVERSED,
+            );
+
+            await queryRunner.commitTransaction();
+
+            reversalTx.status = TransactionStatus.COMPLETED;
+            return reversalTx;
+          } catch (err: any) {
+            if (queryRunner.isTransactionActive) {
+              await queryRunner.rollbackTransaction();
+            }
+            throw err;
+          } finally {
+            await queryRunner.release();
+          }
+        },
+      );
+
+      return {
+        statusCode: HttpStatus.CREATED,
+        transaction: this.mapTransactionResponse(
+          completedReversal,
+          completedReversal.from_account_id ? 'outgoing' : 'incoming',
+          phaseA.destAccountNumber,
+          null,
+        ),
+      };
+    } catch (phaseBError: any) {
+      // Nếu lỗi là ConflictException do giao dịch gốc không còn ở trạng thái COMPLETED -> ghi nhận FAILED rồi ném 409
+      if (phaseBError instanceof ConflictException) {
+        await this.recordFailedTransactionPhaseC(
+          reversalTx.id,
+          TransactionFailureCode.INTERNAL_ERROR,
+        );
+        throw phaseBError;
+      }
+
+      const failureCode = this.classifyPhaseBFailure(phaseBError);
+      await this.recordFailedTransactionPhaseC(reversalTx.id, failureCode);
       this.throwFailureException(failureCode);
     }
   }
@@ -552,10 +773,6 @@ export class TransactionsService {
   // CHI TIẾT PHA A, PHA C & XỬ LÝ REPLAY THEO TRẠNG THÁI
   // =========================================================================
 
-  /**
-   * PHA A: Mở transaction ngắn để kiểm tra Idempotency, kiểm tra sự tồn tại của tài khoản đích (404)
-   * và chặn tự chuyển tiền cho chính mình (400), sau đó INSERT phiếu (INITIATED -> PROCESSING) và COMMIT ngay.
-   */
   private async initiateTransactionPhaseA(
     userId: string,
     idempotencyKey: string,
@@ -575,7 +792,6 @@ export class TransactionsService {
       this.validateActorAccount(actorAccount);
       actorAccountId = actorAccount.id;
 
-      // 1. Kiểm tra Idempotency-Key trước khi tạo phiếu
       const existingTx = await this.findExistingByIdempotencyKey(
         queryRunner.manager,
         actorAccountId,
@@ -583,7 +799,8 @@ export class TransactionsService {
       );
       if (existingTx) {
         await queryRunner.rollbackTransaction();
-        const replay = this.resolveIdempotencyReplay(
+        const replay = await this.resolveIdempotencyReplay(
+          queryRunner.manager,
           existingTx,
           actorAccountId,
           expected,
@@ -597,9 +814,6 @@ export class TransactionsService {
         };
       }
 
-      // 2. Xác định from_account_id và to_account_id theo loại giao dịch
-      // Các lỗi "yêu cầu sai" (404 tài khoản đích không tồn tại, 400 tự chuyển cho chính mình)
-      // được chặn ngay tại đây trước khi lập phiếu (không lưu vào DB).
       let fromAccountId: string | null = null;
       let toAccountId: string | null = null;
       let destAccountNumber: string | null = null;
@@ -627,12 +841,11 @@ export class TransactionsService {
         toAccountId = null;
       }
 
-      // 3. Tạo bản ghi ở trạng thái INITIATED rồi chuyển sang PROCESSING bằng transition()
       const createdTx = queryRunner.manager.create(Transaction, {
         actor_account_id: actorAccount.id,
         from_account_id: fromAccountId,
         to_account_id: toAccountId,
-        original_transaction_id: expected.originalTransactionId ?? null,
+        original_transaction_id: null,
         amount: expected.amount,
         type: expected.type,
         status: TransactionStatus.INITIATED,
@@ -664,8 +877,6 @@ export class TransactionsService {
         await queryRunner.rollbackTransaction();
       }
 
-      // Nếu 2 request cùng Idempotency-Key chạy đồng thời đụng Unique Index (23505) ở Pha A:
-      // Sau khi đã rollback, dùng chính queryRunner.manager đọc lại phiếu đã được tạo và áp dụng bảng Replay.
       if (actorAccountId && error?.code === PG_UNIQUE_VIOLATION) {
         const existingTx = await this.findExistingByIdempotencyKey(
           queryRunner.manager,
@@ -673,7 +884,8 @@ export class TransactionsService {
           idempotencyKey,
         );
         if (existingTx) {
-          const replay = this.resolveIdempotencyReplay(
+          const replay = await this.resolveIdempotencyReplay(
+            queryRunner.manager,
             existingTx,
             actorAccountId,
             expected,
@@ -695,9 +907,181 @@ export class TransactionsService {
   }
 
   /**
-   * PHA C: Mở một transaction ngắn hoàn toàn mới (sau khi Pha B đã rollback)
-   * để đóng dấu PROCESSING -> FAILED kèm failure_code.
+   * PHA A dành riêng cho nghiệp vụ Hoàn tiền (REVERSAL):
+   * Kiểm tra Idempotency-Key của Admin, kiểm tra tính hợp lệ của giao dịch gốc,
+   * và xử lý cả trường hợp đụng Partial Unique Index `IDX_transactions_active_reversal_original`.
    */
+  private async initiateReversalPhaseA(
+    adminUserId: string,
+    originalTransactionId: string,
+    idempotencyKey: string,
+    reversalDescription: string,
+  ): Promise<PhaseAInitiationResult> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    let adminAccountId: string | null = null;
+    let expectedPayload: ExpectedIdempotencyPayload | null = null;
+
+    try {
+      const adminAccount = await queryRunner.manager.findOne(Account, {
+        where: { user_id: adminUserId },
+        relations: { user: true },
+      });
+      this.validateActorAccount(adminAccount);
+      adminAccountId = adminAccount.id;
+
+      // 1. Tải giao dịch gốc để lấy thông tin đối chiếu
+      const originalTx = await queryRunner.manager.findOne(Transaction, {
+        where: { id: originalTransactionId },
+        relations: { fromAccount: true, toAccount: true },
+      });
+
+      // Nếu không tìm thấy giao dịch gốc, vẫn kiểm tra xem Idempotency-Key này đã dùng cho giao dịch khác chưa
+      if (!originalTx) {
+        const existingByKey = await this.findExistingByIdempotencyKey(
+          queryRunner.manager,
+          adminAccountId,
+          idempotencyKey,
+        );
+        if (existingByKey) {
+          throw new ConflictException(
+            'Idempotency-Key đã được sử dụng với nội dung giao dịch khác',
+          );
+        }
+        throw new NotFoundException(
+          'Không tìm thấy giao dịch gốc cần hoàn tiền',
+        );
+      }
+
+      // Đảo chiều tài khoản: from của gốc thành to của REVERSAL, to của gốc thành from của REVERSAL
+      const reversalFromAccountId = originalTx.to_account_id;
+      const reversalToAccountId = originalTx.from_account_id;
+      const counterpartyAccountNumber =
+        originalTx.fromAccount?.account_number ??
+        originalTx.toAccount?.account_number ??
+        null;
+
+      expectedPayload = {
+        type: TransactionType.REVERSAL,
+        amount: originalTx.amount,
+        description: reversalDescription,
+        toAccountNumber: originalTx.fromAccount?.account_number ?? null,
+        originalTransactionId: originalTx.id,
+      };
+
+      // 2. Kiểm tra Idempotency-Key của Admin trước khi kiểm tra trạng thái COMPLETED của gốc
+      // (để nếu giao dịch đã hoàn tiền xong, gửi lại cùng key sẽ trả 200 Replay thay vì báo 409)
+      const existingTx = await this.findExistingByIdempotencyKey(
+        queryRunner.manager,
+        adminAccountId,
+        idempotencyKey,
+      );
+      if (existingTx) {
+        await queryRunner.rollbackTransaction();
+        const replay = await this.resolveIdempotencyReplay(
+          queryRunner.manager,
+          existingTx,
+          adminAccountId,
+          expectedPayload,
+        );
+        return {
+          isReplay: true,
+          statusCode: replay.statusCode,
+          transactionResponse: replay.transaction,
+          actorAccountId: adminAccountId,
+          destAccountNumber: counterpartyAccountNumber,
+        };
+      }
+
+      // 3. Lớp bảo vệ 1: Chỉ cho phép hoàn tiền giao dịch ở trạng thái COMPLETED và không phải là REVERSAL
+      if (originalTx.type === TransactionType.REVERSAL) {
+        throw new ConflictException(
+          'Không thể thực hiện hoàn tiền cho một giao dịch hoàn tiền (REVERSAL)',
+        );
+      }
+      if (originalTx.status !== TransactionStatus.COMPLETED) {
+        throw new ConflictException(
+          `Chỉ có thể hoàn tiền cho giao dịch ở trạng thái COMPLETED (trạng thái hiện tại: ${originalTx.status})`,
+        );
+      }
+
+      // 4. Tạo bản ghi REVERSAL ở trạng thái INITIATED -> PROCESSING
+      const createdReversal = queryRunner.manager.create(Transaction, {
+        actor_account_id: adminAccountId,
+        from_account_id: reversalFromAccountId,
+        to_account_id: reversalToAccountId,
+        original_transaction_id: originalTx.id,
+        amount: originalTx.amount,
+        type: TransactionType.REVERSAL,
+        status: TransactionStatus.INITIATED,
+        failure_code: null,
+        description: reversalDescription,
+        idempotency_key: idempotencyKey,
+      });
+
+      const savedReversal = await queryRunner.manager.save(createdReversal);
+
+      await this.transition(
+        queryRunner.manager,
+        savedReversal.id,
+        TransactionStatus.INITIATED,
+        TransactionStatus.PROCESSING,
+      );
+      savedReversal.status = TransactionStatus.PROCESSING;
+
+      await queryRunner.commitTransaction();
+
+      return {
+        isReplay: false,
+        initiatedTx: savedReversal,
+        actorAccountId: adminAccountId,
+        destAccountNumber: counterpartyAccountNumber,
+      };
+    } catch (error: any) {
+      if (queryRunner.isTransactionActive) {
+        await queryRunner.rollbackTransaction();
+      }
+
+      if (adminAccountId && error?.code === PG_UNIQUE_VIOLATION) {
+        // Trường hợp 1: Trùng (idempotency_key, actor_account_id) -> trả về Replay (hoặc 409 nếu khác payload)
+        if (expectedPayload) {
+          const existingTx = await this.findExistingByIdempotencyKey(
+            queryRunner.manager,
+            adminAccountId,
+            idempotencyKey,
+          );
+          if (existingTx) {
+            const replay = await this.resolveIdempotencyReplay(
+              queryRunner.manager,
+              existingTx,
+              adminAccountId,
+              expectedPayload,
+            );
+            return {
+              isReplay: true,
+              statusCode: replay.statusCode,
+              transactionResponse: replay.transaction,
+              actorAccountId: adminAccountId,
+              destAccountNumber: expectedPayload.toAccountNumber,
+            };
+          }
+        }
+
+        // Trường hợp 2: Đụng Partial Unique Index IDX_transactions_active_reversal_original
+        // (Có một request hoàn tiền khác với key khác cho cùng giao dịch gốc đã/đang chạy) -> 409 Conflict!
+        throw new ConflictException(
+          'Giao dịch này đã được hoàn tiền hoặc đang có yêu cầu hoàn tiền khác xử lý',
+        );
+      }
+
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
   private async recordFailedTransactionPhaseC(
     transactionId: string,
     failureCode: TransactionFailureCode,
@@ -719,7 +1103,6 @@ export class TransactionsService {
       if (queryRunner.isTransactionActive) {
         await queryRunner.rollbackTransaction();
       }
-      // Nếu chính Pha C thất bại (ví dụ mất kết nối DB), ghi log để job quét giao dịch treo xử lý sau
       this.logger.error(
         `[PhaseCFailure] Không thể ghi nhận trạng thái FAILED cho giao dịch ${transactionId}: ${phaseCError?.message}`,
       );
@@ -728,9 +1111,6 @@ export class TransactionsService {
     }
   }
 
-  /**
-   * Phân loại mọi lỗi phát sinh trong Pha B về đúng TransactionFailureCode chuẩn
-   */
   private classifyPhaseBFailure(error: any): TransactionFailureCode {
     if (error instanceof BusinessTransactionError) {
       return error.failureCode;
@@ -755,9 +1135,6 @@ export class TransactionsService {
     return TransactionFailureCode.INTERNAL_ERROR;
   }
 
-  /**
-   * Ném HTTP Exception tương ứng từ bảng FAILURE_CODE_MAP duy nhất
-   */
   private throwFailureException(failureCode: TransactionFailureCode): never {
     const def =
       FAILURE_CODE_MAP[failureCode] ??
@@ -773,18 +1150,12 @@ export class TransactionsService {
     }
   }
 
-  /**
-   * Xử lý Replay Idempotency theo trạng thái hiện tại của giao dịch (Mục V.E):
-   * - Khác payload -> 409 Conflict
-   * - COMPLETED / REVERSED -> 200 OK kèm giao dịch
-   * - INITIATED / PENDING_OTP / PROCESSING -> 202 Accepted kèm giao dịch đang xử lý
-   * - FAILED -> Ném lại đúng lỗi cũ theo failure_code
-   */
-  private resolveIdempotencyReplay(
+  private async resolveIdempotencyReplay(
+    manager: EntityManager,
     existingTx: Transaction,
     actorAccountId: string,
     expected: ExpectedIdempotencyPayload,
-  ): { statusCode: number; transaction: any } {
+  ): Promise<{ statusCode: number; transaction: any }> {
     const isSameType = existingTx.type === expected.type;
     const isSameAmount =
       this.parseDecimalToCents(existingTx.amount) ===
@@ -812,13 +1183,30 @@ export class TransactionsService {
       );
     }
 
+    let reversalTransactionId: string | null = null;
+    if (existingTx.status === TransactionStatus.REVERSED) {
+      const completedRev = await manager.findOne(Transaction, {
+        where: {
+          original_transaction_id: existingTx.id,
+          type: TransactionType.REVERSAL,
+          status: TransactionStatus.COMPLETED,
+        },
+        select: { id: true },
+      });
+      reversalTransactionId = completedRev?.id ?? null;
+    }
+
     if (
       existingTx.status === TransactionStatus.COMPLETED ||
       existingTx.status === TransactionStatus.REVERSED
     ) {
       return {
         statusCode: HttpStatus.OK,
-        transaction: this.mapTransactionItem(existingTx, actorAccountId),
+        transaction: this.mapTransactionItem(
+          existingTx,
+          actorAccountId,
+          reversalTransactionId,
+        ),
       };
     }
 
@@ -831,10 +1219,13 @@ export class TransactionsService {
       );
     }
 
-    // Trạng thái đang xử lý: INITIATED, PENDING_OTP, PROCESSING -> 202 Accepted
     return {
       statusCode: HttpStatus.ACCEPTED,
-      transaction: this.mapTransactionItem(existingTx, actorAccountId),
+      transaction: this.mapTransactionItem(
+        existingTx,
+        actorAccountId,
+        reversalTransactionId,
+      ),
     };
   }
 
@@ -928,10 +1319,6 @@ export class TransactionsService {
     }
   }
 
-  /**
-   * Tải và khóa dòng (SELECT ... FOR UPDATE OF "account") cho tất cả account liên quan
-   * trong MỘT truy vấn duy nhất, sắp xếp theo account.id ASC.
-   */
   private async loadAccountsForTransaction(
     manager: EntityManager,
     userId: string,
@@ -1066,7 +1453,11 @@ export class TransactionsService {
     }
   }
 
-  private mapTransactionItem(tx: Transaction, currentAccountId: string) {
+  private mapTransactionItem(
+    tx: Transaction,
+    currentAccountId: string,
+    reversalTransactionId: string | null = null,
+  ) {
     const isIncoming = tx.to_account_id === currentAccountId;
     const counterpartyAccountNumber = isIncoming
       ? (tx.fromAccount?.account_number ?? null)
@@ -1076,6 +1467,7 @@ export class TransactionsService {
       tx,
       isIncoming ? 'incoming' : 'outgoing',
       counterpartyAccountNumber,
+      reversalTransactionId,
     );
   }
 
@@ -1083,6 +1475,7 @@ export class TransactionsService {
     tx: Transaction,
     direction: 'incoming' | 'outgoing',
     counterpartyAccountNumber: string | null,
+    reversalTransactionId: string | null = null,
   ) {
     return {
       id: tx.id,
@@ -1093,6 +1486,8 @@ export class TransactionsService {
       createdAt: tx.created_at,
       direction,
       counterpartyAccountNumber,
+      originalTransactionId: tx.original_transaction_id ?? null,
+      reversalTransactionId,
     };
   }
 }

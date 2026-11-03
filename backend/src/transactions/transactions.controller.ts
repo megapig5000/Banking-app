@@ -2,24 +2,31 @@ import {
   Controller,
   Get,
   Post,
+  Param,
   Body,
   Query,
   UseGuards,
   Request,
   BadRequestException,
   Res,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { TransactionsService } from './transactions.service';
 import { TransferDto } from './dto/transfer.dto';
 import { CashTransactionDto } from './dto/cash-transaction.dto';
+import { ReverseTransactionDto } from './dto/reverse-transaction.dto';
 import { TransactionQueryDto } from './dto/transaction-query.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
+import { UserRole } from '../database/entities/user.entity';
 import {
   ApiTags,
   ApiOperation,
   ApiBearerAuth,
   ApiResponse,
   ApiHeader,
+  ApiParam,
 } from '@nestjs/swagger';
 import type { Response } from 'express';
 
@@ -34,7 +41,10 @@ export class TransactionsController {
   constructor(private readonly transactionsService: TransactionsService) {}
 
   @Get()
-  @ApiOperation({ summary: 'Lấy lịch sử giao dịch (có phân trang và lọc)' })
+  @ApiOperation({
+    summary:
+      'Lấy lịch sử giao dịch (bao gồm mọi trạng thái, kèm originalTransactionId & reversalTransactionId)',
+  })
   @ApiResponse({
     status: 200,
     description: 'Trả về danh sách giao dịch và thông tin phân trang',
@@ -198,6 +208,71 @@ export class TransactionsController {
       req.user.id,
       idempotencyKey,
       withdrawDto,
+    );
+
+    return res.status(result.statusCode).json(result.transaction);
+  }
+
+  @Post(':id/reverse')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @ApiOperation({
+    summary:
+      'Hoàn tiền một giao dịch COMPLETED bằng giao dịch REVERSAL mới (Chỉ Admin)',
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'UUID của giao dịch gốc cần hoàn tiền',
+  })
+  @ApiHeader({
+    name: 'Idempotency-Key',
+    description: 'UUID để chống double-submit khi hoàn tiền',
+    required: true,
+  })
+  @ApiResponse({
+    status: 201,
+    description:
+      'Hoàn tiền thành công (tạo giao dịch REVERSAL COMPLETED, giao dịch gốc chuyển sang REVERSED)',
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Trả về giao dịch hoàn tiền cũ nếu gửi lại cùng Idempotency Key',
+  })
+  @ApiResponse({
+    status: 202,
+    description: 'Yêu cầu hoàn tiền cùng Idempotency Key đang được xử lý',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Không có quyền Admin',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Không tìm thấy giao dịch gốc',
+  })
+  @ApiResponse({
+    status: 409,
+    description:
+      'Giao dịch gốc không ở trạng thái COMPLETED, là REVERSAL, đã được hoàn tiền, hoặc trùng Idempotency Key khác nội dung',
+  })
+  @ApiResponse({
+    status: 422,
+    description:
+      'Tài khoản nhận tiền không đủ số dư để thu hồi hoàn tiền (REVERSAL_INSUFFICIENT_BALANCE)',
+  })
+  async reverseTransaction(
+    @Request() req: any,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body() reverseDto: ReverseTransactionDto,
+    @Res() res: Response,
+  ) {
+    const idempotencyKey = this.extractIdempotencyKey(req);
+    const result = await this.transactionsService.reverseTransaction(
+      req.user.id,
+      id,
+      idempotencyKey,
+      reverseDto,
     );
 
     return res.status(result.statusCode).json(result.transaction);
