@@ -7,6 +7,15 @@ import { api } from "@/services/api";
 
 type CashTab = "deposit" | "withdraw";
 
+type TransactionType = "TRANSFER" | "DEPOSIT" | "WITHDRAW" | "REVERSAL";
+type TransactionStatus =
+  | "INITIATED"
+  | "PENDING_OTP"
+  | "PROCESSING"
+  | "COMPLETED"
+  | "FAILED"
+  | "REVERSED";
+
 interface Account {
   id: string;
   accountNumber: string;
@@ -18,23 +27,57 @@ interface Account {
 interface TransactionItem {
   id: string;
   amount: string;
-  type: "transfer" | "deposit" | "withdraw";
-  status: string;
+  type: TransactionType;
+  status: TransactionStatus;
   description: string | null;
   createdAt: string;
   direction: "incoming" | "outgoing";
   counterpartyAccountNumber: string | null;
+  originalTransactionId?: string | null;
+  reversalTransactionId?: string | null;
 }
 
 const AMOUNT_REGEX = /^\d{1,16}(\.\d{1,2})?$/;
 
+const STATUS_LABELS: Record<
+  TransactionStatus,
+  { label: string; className: string }
+> = {
+  COMPLETED: {
+    label: "Thành công",
+    className: "bg-green-100 text-green-800",
+  },
+  REVERSED: {
+    label: "Đã được hoàn tiền",
+    className: "bg-purple-100 text-purple-800",
+  },
+  PROCESSING: {
+    label: "Đang xử lý",
+    className: "bg-blue-100 text-blue-800",
+  },
+  INITIATED: {
+    label: "Khởi tạo",
+    className: "bg-gray-100 text-gray-800",
+  },
+  PENDING_OTP: {
+    label: "Chờ OTP",
+    className: "bg-yellow-100 text-yellow-800",
+  },
+  FAILED: {
+    label: "Thất bại",
+    className: "bg-red-100 text-red-800",
+  },
+};
+
 export default function CashPage() {
   const [activeTab, setActiveTab] = useState<CashTab>("deposit");
   const [formData, setFormData] = useState({ amount: "", description: "" });
-  // Khởi tạo trực tiếp UUID ngay trong useState thay vì gọi setState trong useEffect
   const [idempotencyKey, setIdempotencyKey] = useState(() => uuidv4());
   const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState({ type: "", text: "" });
+  const [message, setMessage] = useState<{
+    type: "success" | "error" | "info" | "";
+    text: string;
+  }>({ type: "", text: "" });
 
   const [account, setAccount] = useState<Account | null>(null);
   const [recentTransactions, setRecentTransactions] = useState<
@@ -121,21 +164,43 @@ export default function CashPage() {
         headers: { "Idempotency-Key": idempotencyKey },
       });
 
+      // Nếu nhận 202 Accepted (giao dịch đang ở trạng thái PROCESSING):
+      // GIỮ NGUYÊN idempotencyKey để nếu người dùng bấm gửi lại sẽ kiểm tra đúng giao dịch đó (không tạo GD mới).
+      if (res.status === 202) {
+        setMessage({
+          type: "info",
+          text: `Giao dịch đang được xử lý, vui lòng kiểm tra lại sau. Mã GD: ${res.data.id}`,
+        });
+        await fetchAccountAndRecentTransactions();
+        return;
+      }
+
       const actionLabel = activeTab === "deposit" ? "Nạp tiền" : "Rút tiền";
       setMessage({
         type: "success",
         text: `${actionLabel} thành công! Mã GD: ${res.data.id}`,
       });
       setFormData({ amount: "", description: "" });
+      // Phản hồi kết thúc thành công (201/200) -> sinh Idempotency-Key mới
       setIdempotencyKey(uuidv4());
 
       await fetchAccountAndRecentTransactions();
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
+        // Nếu server ĐÃ trả về phản hồi lỗi cuối cùng (4xx/5xx):
+        // Bản ghi giao dịch (nếu qua Pha A) đã đóng dấu FAILED, gửi lại cùng key sẽ chỉ nhận lại lỗi cũ
+        // -> Phải sinh Idempotency-Key mới.
+        // Ngược lại, nếu KHÔNG có err.response (lỗi mạng / timeout): GIỮ NGUYÊN key để retry an toàn.
+        if (err.response) {
+          setIdempotencyKey(uuidv4());
+          void fetchAccountAndRecentTransactions();
+        }
         const msg = err.response?.data?.message;
         setMessage({
           type: "error",
-          text: Array.isArray(msg) ? msg[0] : msg || "Lỗi hệ thống",
+          text: Array.isArray(msg)
+            ? msg[0]
+            : msg || "Không thể kết nối tới máy chủ, vui lòng thử lại",
         });
       } else {
         setMessage({ type: "error", text: "Lỗi hệ thống" });
@@ -149,6 +214,19 @@ export default function CashPage() {
     new Intl.NumberFormat("vi-VN").format(parseFloat(amount));
   const formatDate = (dateStr: string) =>
     new Date(dateStr).toLocaleString("vi-VN");
+
+  const getTypeLabel = (type: TransactionType) => {
+    switch (type) {
+      case "DEPOSIT":
+        return "Nạp tiền";
+      case "WITHDRAW":
+        return "Rút tiền";
+      case "REVERSAL":
+        return "Hoàn tiền";
+      default:
+        return "Chuyển khoản";
+    }
+  };
 
   return (
     <div className="max-w-3xl mx-auto mt-8 space-y-6">
@@ -208,7 +286,9 @@ export default function CashPage() {
             className={`mb-4 p-4 rounded-md ${
               message.type === "success"
                 ? "bg-green-100 text-green-800"
-                : "bg-red-100 text-red-800"
+                : message.type === "info"
+                  ? "bg-blue-100 text-blue-800"
+                  : "bg-red-100 text-red-800"
             }`}
           >
             {message.text}
@@ -278,45 +358,58 @@ export default function CashPage() {
           <p className="text-sm text-gray-500">Chưa có giao dịch nào.</p>
         ) : (
           <div className="divide-y divide-gray-200">
-            {recentTransactions.map((tx) => (
-              <div
-                key={tx.id}
-                className="py-3 flex items-center justify-between text-sm"
-              >
-                <div>
-                  <span className="font-medium text-gray-900">
-                    {tx.type === "deposit"
-                      ? "Nạp tiền"
-                      : tx.type === "withdraw"
-                        ? "Rút tiền"
-                        : "Chuyển khoản"}
-                  </span>
-                  <span className="text-gray-500 ml-2">
-                    ({tx.counterpartyAccountNumber ?? "Tiền mặt"})
-                  </span>
-                  {tx.description && (
-                    <p className="text-xs text-gray-500 mt-0.5">
-                      {tx.description}
+            {recentTransactions.map((tx) => {
+              const statusBadge = STATUS_LABELS[tx.status] ?? {
+                label: tx.status,
+                className: "bg-gray-100 text-gray-800",
+              };
+              const isFailed = tx.status === "FAILED";
+
+              return (
+                <div
+                  key={tx.id}
+                  className="py-3 flex items-center justify-between text-sm"
+                >
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium text-gray-900">
+                        {getTypeLabel(tx.type)}
+                      </span>
+                      <span className="text-gray-500">
+                        ({tx.counterpartyAccountNumber ?? "Tiền mặt"})
+                      </span>
+                      <span
+                        className={`px-2 py-0.5 rounded text-xs font-medium ${statusBadge.className}`}
+                      >
+                        {statusBadge.label}
+                      </span>
+                    </div>
+                    {tx.description && (
+                      <p className="text-xs text-gray-500 mt-0.5">
+                        {tx.description}
+                      </p>
+                    )}
+                  </div>
+                  <div className="text-right">
+                    <p
+                      className={`font-bold ${
+                        isFailed
+                          ? "text-gray-400 line-through"
+                          : tx.direction === "incoming"
+                            ? "text-green-600"
+                            : "text-red-600"
+                      }`}
+                    >
+                      {tx.direction === "incoming" ? "+" : "-"}
+                      {formatMoney(tx.amount)} VND
                     </p>
-                  )}
+                    <p className="text-xs text-gray-400">
+                      {formatDate(tx.createdAt)}
+                    </p>
+                  </div>
                 </div>
-                <div className="text-right">
-                  <p
-                    className={`font-bold ${
-                      tx.direction === "incoming"
-                        ? "text-green-600"
-                        : "text-red-600"
-                    }`}
-                  >
-                    {tx.direction === "incoming" ? "+" : "-"}
-                    {formatMoney(tx.amount)} VND
-                  </p>
-                  <p className="text-xs text-gray-400">
-                    {formatDate(tx.createdAt)}
-                  </p>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

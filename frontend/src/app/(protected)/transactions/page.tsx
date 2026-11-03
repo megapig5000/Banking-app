@@ -3,15 +3,26 @@
 import { useState, useEffect } from "react";
 import { api } from "@/services/api";
 
+type TransactionType = "TRANSFER" | "DEPOSIT" | "WITHDRAW" | "REVERSAL";
+type TransactionStatus =
+  | "INITIATED"
+  | "PENDING_OTP"
+  | "PROCESSING"
+  | "COMPLETED"
+  | "FAILED"
+  | "REVERSED";
+
 interface Transaction {
   id: string;
   amount: string;
-  type: "transfer" | "deposit" | "withdraw";
-  status: string;
+  type: TransactionType;
+  status: TransactionStatus;
   description: string | null;
   createdAt: string;
   direction: "incoming" | "outgoing";
   counterpartyAccountNumber: string | null;
+  originalTransactionId?: string | null;
+  reversalTransactionId?: string | null;
 }
 
 interface Meta {
@@ -81,18 +92,27 @@ export default function TransactionsPage() {
   const formatDate = (dateStr: string) =>
     new Date(dateStr).toLocaleString("vi-VN");
 
-  const renderTransactionBadge = (tx: Transaction) => {
-    if (tx.type === "deposit") {
+  const renderTransactionTypeBadge = (tx: Transaction) => {
+    if (tx.type === "DEPOSIT") {
       return (
         <span className="text-emerald-700 font-medium bg-emerald-100 px-2 py-1 rounded text-xs">
           + Nạp tiền
         </span>
       );
     }
-    if (tx.type === "withdraw") {
+    if (tx.type === "WITHDRAW") {
       return (
         <span className="text-amber-700 font-medium bg-amber-100 px-2 py-1 rounded text-xs">
           - Rút tiền
+        </span>
+      );
+    }
+    if (tx.type === "REVERSAL") {
+      return (
+        <span className="text-indigo-700 font-medium bg-indigo-100 px-2 py-1 rounded text-xs">
+          {tx.direction === "incoming"
+            ? "+ Hoàn tiền (Nhận)"
+            : "- Hoàn tiền (Trừ)"}
         </span>
       );
     }
@@ -108,6 +128,53 @@ export default function TransactionsPage() {
         - Chuyển khoản (Gửi)
       </span>
     );
+  };
+
+  const renderStatusBadge = (status: TransactionStatus) => {
+    switch (status) {
+      case "COMPLETED":
+        return (
+          <span className="bg-green-100 text-green-800 px-2 py-1 rounded text-xs font-medium">
+            Thành công
+          </span>
+        );
+      case "REVERSED":
+        return (
+          <span className="bg-purple-100 text-purple-800 px-2 py-1 rounded text-xs font-medium">
+            Đã được hoàn tiền
+          </span>
+        );
+      case "PROCESSING":
+        return (
+          <span className="bg-blue-100 text-blue-800 px-2 py-1 rounded text-xs font-medium">
+            Đang xử lý
+          </span>
+        );
+      case "INITIATED":
+        return (
+          <span className="bg-gray-100 text-gray-800 px-2 py-1 rounded text-xs font-medium">
+            Khởi tạo
+          </span>
+        );
+      case "PENDING_OTP":
+        return (
+          <span className="bg-yellow-100 text-yellow-800 px-2 py-1 rounded text-xs font-medium">
+            Chờ OTP
+          </span>
+        );
+      case "FAILED":
+        return (
+          <span className="bg-red-100 text-red-800 px-2 py-1 rounded text-xs font-medium">
+            Thất bại
+          </span>
+        );
+      default:
+        return (
+          <span className="bg-gray-100 text-gray-800 px-2 py-1 rounded text-xs font-medium">
+            {status}
+          </span>
+        );
+    }
   };
 
   return (
@@ -192,6 +259,9 @@ export default function TransactionsPage() {
                   Loại
                 </th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                  Trạng thái
+                </th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
                   Đối tác
                 </th>
                 <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">
@@ -203,36 +273,54 @@ export default function TransactionsPage() {
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
-              {data.map((tx) => (
-                <tr key={tx.id} className="hover:bg-gray-50 transition">
-                  <td className="px-4 py-3 text-sm text-gray-600">
-                    {formatDate(tx.createdAt)}
-                  </td>
-                  <td className="px-4 py-3 text-sm">
-                    {renderTransactionBadge(tx)}
-                  </td>
-                  <td className="px-4 py-3 text-sm text-gray-900 font-mono">
-                    {tx.counterpartyAccountNumber ?? (
-                      <span className="font-sans text-gray-500 italic">
-                        Tiền mặt
-                      </span>
-                    )}
-                  </td>
-                  <td
-                    className={`px-4 py-3 text-sm font-bold text-right ${
-                      tx.direction === "incoming"
-                        ? "text-green-600"
-                        : "text-red-600"
-                    }`}
-                  >
-                    {tx.direction === "incoming" ? "+" : "-"}
-                    {formatMoney(tx.amount)}
-                  </td>
-                  <td className="px-4 py-3 text-sm text-gray-600 truncate max-w-xs">
-                    {tx.description}
-                  </td>
-                </tr>
-              ))}
+              {data.map((tx) => {
+                const isFailed = tx.status === "FAILED";
+                return (
+                  <tr key={tx.id} className="hover:bg-gray-50 transition">
+                    <td className="px-4 py-3 text-sm text-gray-600 whitespace-nowrap">
+                      {formatDate(tx.createdAt)}
+                    </td>
+                    <td className="px-4 py-3 text-sm whitespace-nowrap">
+                      {renderTransactionTypeBadge(tx)}
+                    </td>
+                    <td className="px-4 py-3 text-sm whitespace-nowrap">
+                      {renderStatusBadge(tx.status)}
+                    </td>
+                    <td className="px-4 py-3 text-sm text-gray-900 font-mono whitespace-nowrap">
+                      {tx.counterpartyAccountNumber ?? (
+                        <span className="font-sans text-gray-500 italic">
+                          Tiền mặt
+                        </span>
+                      )}
+                    </td>
+                    <td
+                      className={`px-4 py-3 text-sm font-bold text-right whitespace-nowrap ${
+                        isFailed
+                          ? "text-gray-400 line-through"
+                          : tx.direction === "incoming"
+                            ? "text-green-600"
+                            : "text-red-600"
+                      }`}
+                    >
+                      {tx.direction === "incoming" ? "+" : "-"}
+                      {formatMoney(tx.amount)}
+                    </td>
+                    <td className="px-4 py-3 text-sm text-gray-600 max-w-xs">
+                      <div className="truncate">{tx.description}</div>
+                      {tx.originalTransactionId && (
+                        <div className="text-xs text-indigo-600 font-mono mt-0.5 truncate">
+                          Gốc: {tx.originalTransactionId}
+                        </div>
+                      )}
+                      {tx.reversalTransactionId && (
+                        <div className="text-xs text-purple-600 font-mono mt-0.5 truncate">
+                          Hoàn bởi: {tx.reversalTransactionId}
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
