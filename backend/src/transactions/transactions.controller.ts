@@ -6,6 +6,7 @@ import {
   Body,
   Query,
   UseGuards,
+  UseInterceptors,
   Request,
   BadRequestException,
   Res,
@@ -20,6 +21,9 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { UserRole } from '../database/entities/user.entity';
+import { AuditInterceptor } from '../audit/audit.interceptor';
+import { Audit } from '../audit/audit.decorator';
+import { AuditAction, AuditEntity } from '../audit/audit.constants';
 import {
   ApiTags,
   ApiOperation,
@@ -238,11 +242,33 @@ export class TransactionsController {
   @Post(':id/reverse')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN)
+  @UseInterceptors(AuditInterceptor)
+  @Audit({
+    action: AuditAction.TRANSACTION_REVERSED,
+    entity: AuditEntity.TRANSACTIONS,
+    onSuccess: (req, result) => ({
+      entityId: String(req.params.id),
+      afterData: {
+        originalTransactionId: String(req.params.id),
+        reversalTransactionId: result?.id ?? null,
+        amount: result?.amount ?? null,
+        reason: req.body?.reason ?? null,
+      },
+    }),
+    onError: (req, error) => ({
+      entityId: String(req.params.id),
+      afterData: {
+        originalTransactionId: String(req.params.id),
+        reason: req.body?.reason ?? null,
+        errorMessage: error?.message ?? 'Reversal failed',
+      },
+    }),
+  })
   @ApiOperation({
     summary:
-      'Hoàn tiền một giao dịch COMPLETED bằng giao dịch REVERSAL mới (Chỉ Admin, hỗ trợ Idempotency Snapshot)',
+      'Hoàn tiền một giao dịch COMPLETED bằng giao dịch REVERSAL mới (Chỉ ADMIN, hỗ trợ Idempotency Snapshot & Audit Log)',
     description:
-      'Yêu cầu quyền Admin và header Idempotency-Key (UUID, hạn dùng 24h). Nếu gửi lại cùng key và cùng nội dung, trả về đúng bản chụp kết quả hoàn tiền đã lưu.',
+      'Yêu cầu quyền ADMIN và header Idempotency-Key (UUID, hạn dùng 24h). Nếu gửi lại cùng key và cùng nội dung, trả về đúng bản chụp kết quả hoàn tiền đã lưu.',
   })
   @ApiParam({
     name: 'id',
@@ -269,7 +295,7 @@ export class TransactionsController {
   })
   @ApiResponse({
     status: 403,
-    description: 'Không có quyền Admin',
+    description: 'Không có quyền ADMIN',
   })
   @ApiResponse({
     status: 404,

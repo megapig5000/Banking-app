@@ -56,7 +56,7 @@ export async function createTestApp(): Promise<{
  */
 export async function resetDatabase(dataSource: DataSource): Promise<void> {
   await dataSource.query(
-    'TRUNCATE TABLE "idempotency_keys", "ledger_entries", "transactions", "accounts", "users" RESTART IDENTITY CASCADE',
+    'TRUNCATE TABLE "audit_logs", "idempotency_keys", "ledger_entries", "transactions", "accounts", "users" RESTART IDENTITY CASCADE',
   );
 }
 
@@ -142,6 +142,32 @@ export async function assertLedgerInvariants(
 }
 
 /**
+ * Kiểm tra bộ 2 bất biến Nhật ký kiểm toán (Q6 & Q7 - Module 4A).
+ * Kỳ vọng cả 2 truy vấn đều trả về 0 dòng sai lệch.
+ */
+export async function assertAuditInvariants(
+  dataSource: DataSource,
+): Promise<void> {
+  // Q6: Không có bản ghi audit nào chứa dữ liệu mật (password)
+  const q6Violations = await dataSource.query(`
+    SELECT id, action FROM "audit_logs"
+    WHERE before_data::text ILIKE '%password%'
+       OR after_data::text ILIKE '%password%'
+  `);
+  expect(q6Violations).toEqual([]);
+
+  // Q7: Mỗi lần đổi trạng thái người dùng (USER_STATUS_CHANGED) có đủ ảnh trước/sau khác nhau
+  const q7Violations = await dataSource.query(`
+    SELECT id FROM "audit_logs"
+    WHERE action = 'USER_STATUS_CHANGED'
+      AND (before_data IS NULL
+           OR after_data IS NULL
+           OR before_data->>'status' IS NOT DISTINCT FROM after_data->>'status')
+  `);
+  expect(q7Violations).toEqual([]);
+}
+
+/**
  * Helper tạo nhanh 1 user mới -> đăng nhập lấy JWT -> nạp số dư khởi tạo (nếu > 0)
  */
 export async function createAuthenticatedAccount(
@@ -202,7 +228,7 @@ export async function createAuthenticatedAccount(
 }
 
 /**
- * Helper tạo nhanh 1 tài khoản Admin (role = UserRole.ADMIN) phục vụ test hoàn tiền REVERSAL
+ * Helper tạo nhanh 1 tài khoản Admin (role = UserRole.ADMIN) phục vụ test hoàn tiền REVERSAL & Admin API
  */
 export async function createAuthenticatedAdmin(
   app: INestApplication<App>,

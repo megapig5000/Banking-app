@@ -3,7 +3,7 @@
 ## ADR-001: Why NestJS + PostgreSQL + TypeORM
 * **Context**: Cần chọn stack backend cho ứng dụng ngân hàng đáp ứng yêu cầu kiến trúc phân tầng rõ ràng và đảm bảo tính toàn vẹn dữ liệu giao dịch.
 * **Decision**: Sử dụng NestJS (TypeScript) làm backend framework, TypeORM làm ORM và PostgreSQL làm hệ quản trị cơ sở dữ liệu.
-* **Reason**: NestJS cung cấp sẵn kiến trúc module hóa (`Controller -> Service -> Repository`) và tích hợp sẵn `ValidationPipe`, Guard, Swagger. TypeORM hỗ trợ tốt quản lý Database Transaction (`QueryRunner`) và Migration. PostgreSQL tuân thủ chuẩn ACID và hỗ trợ tốt kiểu số thập phân chính xác (`numeric`).
+* **Reason**: NestJS cung cấp sẵn kiến trúc module hóa (`Controller -> Service -> Repository`) và tích hợp sẵn `ValidationPipe`, Guard, Interceptor, Swagger. TypeORM hỗ trợ tốt quản lý Database Transaction (`QueryRunner`), Entity Subscriber và Migration. PostgreSQL tuân thủ chuẩn ACID và hỗ trợ tốt kiểu số thập phân chính xác (`numeric`).
 * **Trade-offs**: Cấu hình khởi đầu của NestJS và TypeORM Migration nhiều bước hơn so với ExpressJS thuần, nhưng giúp mã nguồn nhất quán và dễ mở rộng.
 
 ## ADR-002: Why numeric(18,2)
@@ -47,7 +47,7 @@
 * **Trade-offs**: Access Token lưu trong `localStorage` đòi hỏi kiểm soát chặt XSS và giới hạn thời hạn token (`1h`).
 
 ## ADR-007: Why TypeORM Migrations Instead of Synchronize
-* **Context**: Khi mở rộng sang các bài tập nâng cao (thêm `CHECK` constraint, đổi tên/thêm giá trị enum, thêm bảng sổ cái kép kèm backfill, trigger, partial unique index và bảng `idempotency_keys`), `synchronize: true` không thể kiểm soát thứ tự chuyển đổi dữ liệu.
+* **Context**: Khi mở rộng sang các bài tập nâng cao (thêm `CHECK` constraint, đổi tên/thêm giá trị enum, thêm bảng sổ cái kép kèm backfill, trigger, partial unique index, bảng `idempotency_keys` và bảng `audit_logs`), `synchronize: true` không thể kiểm soát thứ tự chuyển đổi dữ liệu.
 * **Decision**: Tắt hoàn toàn `synchronize: true` (`synchronize: false` trong `data-source.ts`) và quản lý mọi thay đổi schema qua TypeORM Migrations.
 * **Reason**: Mọi thay đổi cấu trúc DB đều tường minh, có phiên bản trên Git, hỗ trợ rollback (`down`) và ánh xạ dữ liệu cũ an toàn.
 * **Trade-offs**: Mỗi khi sửa Entity phải tạo và chạy file migration tương ứng.
@@ -89,7 +89,7 @@
   1. Khi cần hủy hoặc hoàn tiền một giao dịch đã `COMPLETED`, hệ thống tài chính không được phép `UPDATE` số tiền hay `DELETE` giao dịch/bút toán cũ.
   2. Cần ngăn chặn tuyệt đối việc một giao dịch gốc bị hoàn tiền hai lần (kể cả khi nhiều Admin bấm hoàn tiền đồng thời), nhưng vẫn phải cho phép thử lại nếu lần hoàn tiền trước thất bại do bên nhận tạm thời thiếu số dư.
 * **Decision**:
-  1. **Hoàn tiền bằng giao dịch `REVERSAL` mới và đảo từng bút toán gốc (`DEBIT ↔ CREDIT`):** Endpoint `POST /api/transactions/:id/reverse` (bảo vệ bởi `RolesGuard` kiểm tra `user.role === 'admin'` từ DB) tạo một giao dịch mới có `type = 'REVERSAL'`, `original_transaction_id = gốc`, đảo chiều `from_account_id ↔ to_account_id`, và đảo ngược từng dòng `ledger_entries` của giao dịch gốc. Trong cùng transaction Pha B, đóng dấu `REVERSAL: PROCESSING → COMPLETED` và đóng dấu giao dịch gốc `COMPLETED → REVERSED`.
+  1. **Hoàn tiền bằng giao dịch `REVERSAL` mới và đảo từng bút toán gốc (`DEBIT ↔ CREDIT`):** Endpoint `POST /api/transactions/:id/reverse` (bảo vệ bởi `RolesGuard` kiểm tra `user.role === 'ADMIN'` từ DB) tạo một giao dịch mới có `type = 'REVERSAL'`, `original_transaction_id = gốc`, đảo chiều `from_account_id ↔ to_account_id`, và đảo ngược từng dòng `ledger_entries` của giao dịch gốc. Trong cùng transaction Pha B, đóng dấu `REVERSAL: PROCESSING → COMPLETED` và đóng dấu giao dịch gốc `COMPLETED → REVERSED`.
   2. **Ba lớp chống hoàn tiền hai lần:** (1) Kiểm tra trạng thái gốc phải là `COMPLETED` ở Pha A; (2) Partial Unique Index `IDX_transactions_active_reversal_original` (`WHERE type = 'REVERSAL' AND status IN ('INITIATED', 'PENDING_OTP', 'PROCESSING', 'COMPLETED')` — loại trừ `FAILED` để cho phép thử lại); (3) Đóng dấu có điều kiện `transition(originalTx.id, COMPLETED, REVERSED)` ở Pha B.
   3. **Đồng bộ Enum chữ HOA qua Migration (`1710000003000`):** Đổi toàn bộ giá trị `TransactionType` và `TransactionStatus` sang chữ HOA bằng kỹ thuật tạo kiểu enum mới + `ALTER COLUMN ... TYPE ... USING (CASE ...)`.
 * **Reason**: Giữ nguyên tính bất biến của bảng `ledger_entries` và thỏa mãn các bất biến Q4 (tổng ròng gốc + hoàn tiền = 0), Q5 (nhất quán 1-1 giữa `REVERSED` và `REVERSAL COMPLETED`).
@@ -111,3 +111,38 @@
   * Phạm vi `user_id` ngăn chặn rò rỉ dữ liệu giao dịch giữa các người dùng khác nhau khi tình cờ trùng UUID (bài test `I8`).
 * **Trade-offs**:
   * Khi chạy migration nâng cấp xóa cột `transactions.idempotency_key`, các khóa cũ trước thời điểm nâng cấp không được backfill (vì không có `request_hash` và `response_body` gốc, đồng thời khóa vốn chỉ có hạn dùng 24 giờ).
+
+## ADR-014: Why Database-Backed Two-Role RBAC (`CUSTOMER` / `ADMIN`), Controller-Level `@Roles()` Guard, Dedicated `/admin/*` Endpoints, and Account Ownership Check
+* **Context**:
+  1. Hệ thống cần phân tách rõ ràng giữa quyền hạn của khách hàng cá nhân (`CUSTOMER`) và quản trị viên hệ thống (`ADMIN`), đồng thời đáp ứng yêu cầu kiểm thử của Bài 4.1 (*"CUSTOMER gọi API xem tài khoản người khác → bị từ chối 403"*).
+  2. Nếu lưu cứng vai trò (`role`) hoặc trạng thái (`status`) bên trong JWT payload và chỉ giải mã tĩnh ở mỗi request, khi một người dùng bị khóa hoặc bị thu hồi quyền `ADMIN`, token cũ của họ vẫn tiếp tục sử dụng được cho tới khi hết hạn (1 giờ).
+* **Decision**:
+  1. **Chuẩn hóa Enum hai vai trò `UserRole` (`CUSTOMER`, `ADMIN`) và đọc trực tiếp từ Database mỗi request:** JWT payload chỉ chứa định danh tối thiểu `{ sub: user.id }`. Tại mỗi request, `JwtStrategy.validate()` truy vấn bảng `users` trong PostgreSQL để nạp `user.role` và `user.status` mới nhất vào `req.user`, sau đó `RolesGuard` đối chiếu với metadata `@Roles(...)` (đọc qua `Reflector.getAllAndOverride` ở cả cấp Method và cấp Controller).
+  2. **Tách nhóm `/api/admin/*` bảo vệ ở cấp Controller và kiểm tra sở hữu tại `GET /api/accounts/:accountNumber`:**
+     * Gắn `@UseGuards(JwtAuthGuard, RolesGuard)` và `@Roles(UserRole.ADMIN)` ngay trên class `AdminController` (`/api/admin/users`, `/api/admin/users/:id/status`, `/api/admin/transactions`, `/api/admin/audit-logs`) để mọi route quản trị tự động thừa hưởng chính sách chỉ dành cho `ADMIN`.
+     * Tại `GET /api/accounts/:accountNumber`: nếu người gọi là `CUSTOMER` mà `account.user_id !== requester.id` thì trả về `403 Forbidden`; nếu người gọi là `ADMIN` thì xem được mọi tài khoản (trả `404` nếu không tồn tại).
+     * Các endpoint giao dịch cá nhân (`/api/accounts/me`, `/api/transactions/transfer|deposit|withdraw`, `GET /api/transactions`) mở cho mọi người dùng đã xác thực (`active`) và chỉ thao tác trên chính tài khoản gắn với `req.user.id`.
+  3. **Phạm vi bản rút gọn (`DEFERRED / HOÃN`):** Giữ đúng 2 vai trò `CUSTOMER` và `ADMIN`; hoãn vai trò `TELLER`, nghiệp vụ giao dịch hộ khách tại quầy (`/staff/transactions/*`), hạn mức duyệt của giao dịch viên và giao diện Admin UI (sử dụng Swagger / `curl` để thao tác quản trị).
+* **Reason**:
+  * Đọc `role` và `status` từ Database ở mỗi request giúp thao tác khóa tài khoản (`PATCH /api/admin/users/:id/status`) hoặc thay đổi vai trò có **hiệu lực tức thì (0 giây độ trễ)** đối với cả những JWT token đã cấp trước đó (được chứng minh bằng bài test `RB3` và `AD2`).
+  * Đặt `@Roles(UserRole.ADMIN)` ở mức class `AdminController` loại bỏ hoàn toàn rủi ro lập trình viên thêm route mới vào controller quản trị nhưng quên gắn decorator phân quyền.
+* **Trade-offs**:
+  * Mỗi request có xác thực thực hiện 1 câu truy vấn `SELECT` theo khóa chính `users.id` (chi phí < 1ms nhờ Primary Key Index của PostgreSQL), đổi lại tính an toàn bảo mật tức thời mà không cần hệ thống danh sách đen (token blacklist) trên Redis.
+  * Việc trả `403 Forbidden` trên `GET /api/accounts/:accountNumber` đối với mọi số tài khoản không thuộc về `CUSTOMER` giúp đáp ứng đúng kịch bản kiểm thử của đề bài và ngăn `CUSTOMER` phân biệt `403`/`404` trên endpoint này (dù sự tồn tại của số tài khoản đích vốn vẫn có thể nhận biết khi thực hiện chuyển khoản).
+
+## ADR-015: Why Dual-Mechanism Automated Audit Trail (TypeORM Subscriber + NestJS Interceptor + `AsyncLocalStorage`), `WeakMap` Before-Image Capture, In-Transaction Persistence, Whitelisted Fields, and Append-Only `audit_logs`
+* **Context**:
+  1. Ngân hàng bắt buộc phải lưu vết kiểm toán ("ai đã làm gì, khi nào, từ IP/User-Agent nào, dữ liệu trước `before_data` và sau `after_data` ra sao") cho các thao tác nhạy cảm (Bài 3.3).
+  2. Nếu gọi hàm ghi log thủ công ở từng hàm Service thì dễ bỏ sót; nếu ghi nhật ký thay đổi dữ liệu ở ngoài Database Transaction thì khi giao dịch bị rollback sẽ sinh ra nhật ký giả; và nếu chụp toàn bộ thực thể `User` thì sẽ làm lộ `password_hash` trong bảng `audit_logs`.
+* **Decision**:
+  1. **Bảng `audit_logs` chỉ-ghi-thêm với khóa chính `BIGSERIAL` (Phụ lục P.1):** Sử dụng `@PrimaryGeneratedColumn({ type: 'bigint' })` đồng bộ với `generationStrategy: 'increment'` trong Migration `1710000005000`, kèm 3 index (`(created_at)`, `(actor_id, id)`, `(entity, entity_id)`) và Trigger `trg_audit_logs_immutable` chặn mọi thao tác `UPDATE` và `DELETE`.
+  2. **Truyền ngữ cảnh yêu cầu bằng `AsyncLocalStorage` (`RequestContextMiddleware`):** Mở ngữ cảnh ngay tại Middleware (lưu tham chiếu tới `req`) và thực hiện **đọc trễ (lazy read)** tại thời điểm ghi audit (sau khi `JwtAuthGuard` đã gán `req.user`), đồng thời cắt `user_agent` tối đa 255 ký tự và `ip_address` tối đa 64 ký tự.
+  3. **Kết hợp hai cơ chế tự động (Subscriber + Interceptor):**
+     * **`UserAuditSubscriber` (TypeORM `EntitySubscriberInterface<User>`) cho thay đổi dữ liệu `User`:** Chụp bản sao của đúng 4 trường trong danh sách trắng `ALLOWED_USER_AUDIT_FIELDS = ['fullName', 'email', 'role', 'status']` vào `WeakMap` ngay tại `afterLoad` (giải quyết triệt để Phụ lục P.2 khi Service sửa trực tiếp trên cùng instance `user` trước khi gọi `manager.save(User, user)`). Trong `afterUpdate`, so sánh ảnh trước và ảnh sau, nếu có thay đổi thì chèn bản ghi `USER_STATUS_CHANGED` / `USER_UPDATED` bằng chính **`event.manager`** (nằm trong **cùng một Database Transaction** với thao tác sửa `User`).
+     * **`AuditInterceptor` + Decorator `@Audit(...)` cho các sự kiện nghiệp vụ HTTP:** Gắn lên `POST /api/auth/login` (`AUTH_LOGIN_SUCCESS` / `AUTH_LOGIN_FAILED`) và `POST /api/transactions/:id/reverse` (`TRANSACTION_REVERSED`). Ghi nhận cả khi thành công lẫn khi lỗi (`catchError` ghi bản ghi kèm `outcome: 'ERROR'` rồi **ném lại nguyên vẹn lỗi đó** cho client).
+* **Reason**:
+  * Ghi qua `event.manager` trong `UserAuditSubscriber` đảm bảo tính nguyên tử tuyệt đối: nếu transaction cập nhật `User` bị lỗi và rollback, dòng nhật ký kiểm toán cũng tự động rollback theo (được chứng minh bằng bài test `AU6`).
+  * Danh sách trắng `ALLOWED_USER_AUDIT_FIELDS` ở một nơi duy nhất đảm bảo `password_hash` không bao giờ xuất hiện trong `before_data` hay `after_data` (thỏa mãn bất biến **Q6** và **Q7**).
+* **Trade-offs**:
+  * Các bản ghi do `AuditInterceptor` tạo ra (như `AUTH_LOGIN_FAILED` khi đăng nhập sai mật khẩu) chạy theo cơ chế *best-effort* ngay sau khi handler xử lý chứ không nằm chung trong một transaction nghiệp vụ.
+  * TypeORM Subscriber chỉ kích hoạt khi cập nhật qua `.save()`; các câu lệnh `UPDATE` bằng biểu thức SQL thông qua `QueryBuilder` (như cập nhật số dư `accounts.balance` hoặc `transactions.status`) không đi qua Subscriber vì đã được ghi vết chuyên biệt bởi Sổ cái kép (`ledger_entries`) và State Machine (`transactions`).
