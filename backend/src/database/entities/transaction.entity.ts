@@ -7,7 +7,6 @@ import {
   ManyToOne,
   JoinColumn,
   Index,
-  Unique,
   Check,
 } from 'typeorm';
 import { Account } from './account.entity';
@@ -42,7 +41,6 @@ export enum TransactionStatus {
 @Index('IDX_transactions_processing_updated_at', ['updated_at'], {
   where: `"status" = 'PROCESSING'`,
 })
-@Unique(['idempotency_key', 'actor_account_id'])
 @Check(
   'CHK_transactions_type_accounts',
   `("type" = 'TRANSFER' AND "from_account_id" IS NOT NULL AND "to_account_id" IS NOT NULL AND "from_account_id" <> "to_account_id" AND "original_transaction_id" IS NULL) OR ("type" = 'DEPOSIT' AND "from_account_id" IS NULL AND "to_account_id" IS NOT NULL AND "original_transaction_id" IS NULL) OR ("type" = 'WITHDRAW' AND "from_account_id" IS NOT NULL AND "to_account_id" IS NULL AND "original_transaction_id" IS NULL) OR ("type" = 'REVERSAL' AND ("from_account_id" IS NOT NULL OR "to_account_id" IS NOT NULL) AND ("from_account_id" IS NULL OR "to_account_id" IS NULL OR "from_account_id" <> "to_account_id") AND "original_transaction_id" IS NOT NULL)`,
@@ -105,9 +103,6 @@ export class Transaction {
 
   @Column({ type: 'varchar', length: 255, nullable: true })
   description: string | null;
-
-  @Column({ type: 'uuid', nullable: true })
-  idempotency_key: string | null;
 
   @CreateDateColumn({ type: 'timestamptz' })
   created_at: Date;

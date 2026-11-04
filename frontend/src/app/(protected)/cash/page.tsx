@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
-import { api } from "@/services/api";
+import { api, submitIdempotentTransaction } from "@/services/api";
 
 type CashTab = "deposit" | "withdraw";
 
@@ -74,10 +74,14 @@ export default function CashPage() {
   const [formData, setFormData] = useState({ amount: "", description: "" });
   const [idempotencyKey, setIdempotencyKey] = useState(() => uuidv4());
   const [loading, setLoading] = useState(false);
+  const [retryStatus, setRetryStatus] = useState<string | null>(null);
   const [message, setMessage] = useState<{
-    type: "success" | "error" | "info" | "";
+    type: "success" | "error" | "warning" | "";
     text: string;
   }>({ type: "", text: "" });
+
+  // Cờ khóa đồng bộ bằng useRef để chặn bấm đúp trong cùng một tích tắc trước khi React kịp re-render
+  const inFlightRef = useRef(false);
 
   const [account, setAccount] = useState<Account | null>(null);
   const [recentTransactions, setRecentTransactions] = useState<
@@ -118,7 +122,7 @@ export default function CashPage() {
   }, []);
 
   const handleTabChange = (tab: CashTab) => {
-    if (tab === activeTab || loading) return;
+    if (tab === activeTab || loading || inFlightRef.current) return;
     setActiveTab(tab);
     setIdempotencyKey(uuidv4());
     setMessage({ type: "", text: "" });
@@ -127,6 +131,7 @@ export default function CashPage() {
   const handleChange = (
     e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
   ) => {
+    if (inFlightRef.current) return;
     setFormData({ ...formData, [e.target.name]: e.target.value });
     setIdempotencyKey(uuidv4());
     setMessage({ type: "", text: "" });
@@ -134,6 +139,12 @@ export default function CashPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // Chặn ngay lần bấm thứ hai trong cùng tích tắc bằng cờ đồng bộ useRef
+    if (inFlightRef.current) {
+      return;
+    }
+
     setMessage({ type: "", text: "" });
 
     const trimmedAmount = formData.amount.trim();
@@ -145,7 +156,9 @@ export default function CashPage() {
       return;
     }
 
+    inFlightRef.current = true;
     setLoading(true);
+    setRetryStatus(null);
 
     try {
       const endpoint =
@@ -160,25 +173,33 @@ export default function CashPage() {
         payload.description = formData.description.trim();
       }
 
-      const res = await api.post(endpoint, payload, {
-        headers: { "Idempotency-Key": idempotencyKey },
-      });
+      const result = await submitIdempotentTransaction<TransactionItem>(
+        endpoint,
+        payload,
+        idempotencyKey,
+        (attempt, maxRetries) => {
+          setRetryStatus(`Đang thử lại (lần ${attempt}/${maxRetries})...`);
+        },
+      );
 
-      // Nếu nhận 202 Accepted (giao dịch đang ở trạng thái PROCESSING):
-      // GIỮ NGUYÊN idempotencyKey để nếu người dùng bấm gửi lại sẽ kiểm tra đúng giao dịch đó (không tạo GD mới).
-      if (res.status === 202) {
+      // Nếu hết số lần thử lại mà vẫn chưa biết kết quả (timeout/mất mạng/202 kéo dài):
+      // Hiển thị trạng thái "chưa xác định" và GIỮ NGUYÊN idempotencyKey để bấm gửi lại an toàn!
+      if (result.outcome === "indeterminate") {
+        const txHint = result.lastTransactionId
+          ? ` (Mã GD tạm thời: ${result.lastTransactionId})`
+          : "";
         setMessage({
-          type: "info",
-          text: `Giao dịch đang được xử lý, vui lòng kiểm tra lại sau. Mã GD: ${res.data.id}`,
+          type: "warning",
+          text: `Chưa xác nhận được giao dịch${txHint}. Vui lòng kiểm tra Lịch sử giao dịch trước khi thử lại, hoặc bấm xác nhận lại để kiểm tra kết quả với cùng mã giao dịch.`,
         });
-        await fetchAccountAndRecentTransactions();
+        void fetchAccountAndRecentTransactions();
         return;
       }
 
       const actionLabel = activeTab === "deposit" ? "Nạp tiền" : "Rút tiền";
       setMessage({
         type: "success",
-        text: `${actionLabel} thành công! Mã GD: ${res.data.id}`,
+        text: `${actionLabel} thành công! Mã GD: ${result.data.id}`,
       });
       setFormData({ amount: "", description: "" });
       // Phản hồi kết thúc thành công (201/200) -> sinh Idempotency-Key mới
@@ -187,10 +208,7 @@ export default function CashPage() {
       await fetchAccountAndRecentTransactions();
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
-        // Nếu server ĐÃ trả về phản hồi lỗi cuối cùng (4xx/5xx):
-        // Bản ghi giao dịch (nếu qua Pha A) đã đóng dấu FAILED, gửi lại cùng key sẽ chỉ nhận lại lỗi cũ
-        // -> Phải sinh Idempotency-Key mới.
-        // Ngược lại, nếu KHÔNG có err.response (lỗi mạng / timeout): GIỮ NGUYÊN key để retry an toàn.
+        // Nếu server ĐÃ trả về phản hồi lỗi cuối cùng (4xx/5xx): sinh Idempotency-Key mới
         if (err.response) {
           setIdempotencyKey(uuidv4());
           void fetchAccountAndRecentTransactions();
@@ -200,13 +218,15 @@ export default function CashPage() {
           type: "error",
           text: Array.isArray(msg)
             ? msg[0]
-            : msg || "Không thể kết nối tới máy chủ, vui lòng thử lại",
+            : msg || "Không thể thực hiện giao dịch, vui lòng thử lại",
         });
       } else {
         setMessage({ type: "error", text: "Lỗi hệ thống" });
       }
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
+      setRetryStatus(null);
     }
   };
 
@@ -259,8 +279,9 @@ export default function CashPage() {
         <div className="flex border-b mb-6">
           <button
             type="button"
+            disabled={loading}
             onClick={() => handleTabChange("deposit")}
-            className={`flex-1 py-3 text-center font-semibold border-b-2 transition ${
+            className={`flex-1 py-3 text-center font-semibold border-b-2 transition disabled:opacity-50 ${
               activeTab === "deposit"
                 ? "border-emerald-600 text-emerald-700 bg-emerald-50/50"
                 : "border-transparent text-gray-500 hover:text-gray-700"
@@ -270,8 +291,9 @@ export default function CashPage() {
           </button>
           <button
             type="button"
+            disabled={loading}
             onClick={() => handleTabChange("withdraw")}
-            className={`flex-1 py-3 text-center font-semibold border-b-2 transition ${
+            className={`flex-1 py-3 text-center font-semibold border-b-2 transition disabled:opacity-50 ${
               activeTab === "withdraw"
                 ? "border-amber-600 text-amber-700 bg-amber-50/50"
                 : "border-transparent text-gray-500 hover:text-gray-700"
@@ -281,13 +303,20 @@ export default function CashPage() {
           </button>
         </div>
 
+        {retryStatus && (
+          <div className="mb-4 p-4 rounded-md bg-blue-50 border border-blue-200 text-blue-800 text-sm font-medium">
+            {retryStatus} Hệ thống đang giữ nguyên mã giao dịch để đảm bảo không
+            xử lý trùng lặp.
+          </div>
+        )}
+
         {message.text && (
           <div
             className={`mb-4 p-4 rounded-md ${
               message.type === "success"
                 ? "bg-green-100 text-green-800"
-                : message.type === "info"
-                  ? "bg-blue-100 text-blue-800"
+                : message.type === "warning"
+                  ? "bg-amber-100 text-amber-900 border border-amber-300"
                   : "bg-red-100 text-red-800"
             }`}
           >
@@ -306,7 +335,8 @@ export default function CashPage() {
               required
               min="1"
               step="0.01"
-              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900"
+              disabled={loading}
+              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900 disabled:bg-gray-100"
               value={formData.amount}
               onChange={handleChange}
               placeholder="VD: 100000"
@@ -321,7 +351,8 @@ export default function CashPage() {
               name="description"
               maxLength={200}
               rows={3}
-              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900"
+              disabled={loading}
+              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900 disabled:bg-gray-100"
               value={formData.description}
               onChange={handleChange}
               placeholder={
@@ -342,7 +373,7 @@ export default function CashPage() {
             }`}
           >
             {loading
-              ? "Đang thực hiện..."
+              ? retryStatus || "Đang thực hiện..."
               : activeTab === "deposit"
                 ? "Xác nhận nạp tiền"
                 : "Xác nhận rút tiền"}

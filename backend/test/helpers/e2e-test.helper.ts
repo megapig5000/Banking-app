@@ -56,7 +56,7 @@ export async function createTestApp(): Promise<{
  */
 export async function resetDatabase(dataSource: DataSource): Promise<void> {
   await dataSource.query(
-    'TRUNCATE TABLE "ledger_entries", "transactions", "accounts", "users" RESTART IDENTITY CASCADE',
+    'TRUNCATE TABLE "idempotency_keys", "ledger_entries", "transactions", "accounts", "users" RESTART IDENTITY CASCADE',
   );
 }
 

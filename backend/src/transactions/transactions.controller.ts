@@ -33,6 +33,9 @@ import type { Response } from 'express';
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+const IDEMPOTENCY_HEADER_DESC =
+  'UUID v4 chống xử lý trùng lặp (phạm vi theo từng người dùng, hạn dùng 24 giờ, lưu bản chụp kết quả trả về)';
+
 @ApiTags('Transactions')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
@@ -57,42 +60,48 @@ export class TransactionsController {
   }
 
   @Post('transfer')
-  @ApiOperation({ summary: 'Thực hiện chuyển khoản nội bộ' })
+  @ApiOperation({
+    summary: 'Thực hiện chuyển khoản nội bộ (hỗ trợ Idempotency Snapshot)',
+    description:
+      'Yêu cầu header Idempotency-Key (UUID, hạn dùng 24h). Nếu gửi lại cùng key và cùng nội dung (request_hash), API trả về đúng bản chụp kết quả (response_body snapshot) đã lưu ở lần xử lý đầu tiên.',
+  })
   @ApiHeader({
     name: 'Idempotency-Key',
-    description: 'UUID để chống double-submit',
+    description: IDEMPOTENCY_HEADER_DESC,
     required: true,
   })
   @ApiResponse({
     status: 201,
-    description: 'Chuyển khoản thành công (giao dịch mới COMPLETED)',
+    description:
+      'Chuyển khoản thành công (giao dịch mới COMPLETED, đã lưu bản chụp kết quả)',
   })
   @ApiResponse({
     status: 200,
     description:
-      'Trả về giao dịch cũ nếu gửi lại cùng Idempotency Key (COMPLETED/REVERSED)',
+      'Phát lại (Replay): trả về đúng bản chụp kết quả (response_body snapshot) đã lưu của Idempotency-Key',
   })
   @ApiResponse({
     status: 202,
     description:
-      'Giao dịch cùng Idempotency Key đang được xử lý (INITIATED/PENDING_OTP/PROCESSING)',
+      'Yêu cầu cùng Idempotency-Key đang được xử lý (IN_PROGRESS / PROCESSING)',
   })
   @ApiResponse({
     status: 400,
-    description: 'Thiếu header, DTO sai, hoặc tự chuyển cho chính mình',
+    description: 'Thiếu/sai định dạng header UUID, DTO sai, hoặc tự chuyển',
   })
   @ApiResponse({
     status: 409,
-    description: 'Trùng Idempotency Key nhưng khác payload hoặc khác loại GD',
+    description:
+      'Trùng Idempotency-Key nhưng khác nội dung yêu cầu (request_hash khác)',
   })
   @ApiResponse({
     status: 422,
     description:
-      'Không đủ số dư hoặc tài khoản đích bị khóa (ghi nhận FAILED kèm failure_code)',
+      'Không đủ số dư hoặc tài khoản đích bị khóa (ghi nhận FAILED kèm bản chụp lỗi)',
   })
   @ApiResponse({
     status: 503,
-    description: 'Hệ thống đang bận (quá thời gian chờ khóa tài khoản)',
+    description: 'Hệ thống đang bận hoặc giao dịch quá thời gian chờ khóa',
   })
   async transfer(
     @Request() req: any,
@@ -110,33 +119,40 @@ export class TransactionsController {
   }
 
   @Post('deposit')
-  @ApiOperation({ summary: 'Nạp tiền vào tài khoản của bản thân' })
+  @ApiOperation({
+    summary:
+      'Nạp tiền vào tài khoản của bản thân (hỗ trợ Idempotency Snapshot)',
+    description:
+      'Yêu cầu header Idempotency-Key (UUID, hạn dùng 24h). Nếu gửi lại cùng key và cùng nội dung (request_hash), API trả về đúng bản chụp kết quả đã lưu.',
+  })
   @ApiHeader({
     name: 'Idempotency-Key',
-    description: 'UUID để chống double-submit',
+    description: IDEMPOTENCY_HEADER_DESC,
     required: true,
   })
   @ApiResponse({
     status: 201,
-    description: 'Nạp tiền thành công (giao dịch mới COMPLETED)',
+    description:
+      'Nạp tiền thành công (giao dịch mới COMPLETED, đã lưu bản chụp kết quả)',
   })
   @ApiResponse({
     status: 200,
     description:
-      'Trả về giao dịch cũ nếu gửi lại cùng Idempotency Key (COMPLETED/REVERSED)',
+      'Phát lại (Replay): trả về đúng bản chụp kết quả (response_body snapshot) đã lưu',
   })
   @ApiResponse({
     status: 202,
     description:
-      'Giao dịch cùng Idempotency Key đang được xử lý (INITIATED/PENDING_OTP/PROCESSING)',
+      'Yêu cầu cùng Idempotency-Key đang được xử lý (IN_PROGRESS / PROCESSING)',
   })
   @ApiResponse({
     status: 400,
-    description: 'Thiếu header hoặc số tiền không hợp lệ',
+    description: 'Thiếu/sai định dạng header UUID hoặc số tiền không hợp lệ',
   })
   @ApiResponse({
     status: 409,
-    description: 'Trùng Idempotency Key nhưng khác payload hoặc khác loại GD',
+    description:
+      'Trùng Idempotency-Key nhưng khác nội dung yêu cầu (request_hash khác)',
   })
   @ApiResponse({
     status: 422,
@@ -162,37 +178,43 @@ export class TransactionsController {
   }
 
   @Post('withdraw')
-  @ApiOperation({ summary: 'Rút tiền từ tài khoản của bản thân' })
+  @ApiOperation({
+    summary: 'Rút tiền từ tài khoản của bản thân (hỗ trợ Idempotency Snapshot)',
+    description:
+      'Yêu cầu header Idempotency-Key (UUID, hạn dùng 24h). Nếu gửi lại cùng key và cùng nội dung (request_hash), API trả về đúng bản chụp kết quả đã lưu.',
+  })
   @ApiHeader({
     name: 'Idempotency-Key',
-    description: 'UUID để chống double-submit',
+    description: IDEMPOTENCY_HEADER_DESC,
     required: true,
   })
   @ApiResponse({
     status: 201,
-    description: 'Rút tiền thành công (giao dịch mới COMPLETED)',
+    description:
+      'Rút tiền thành công (giao dịch mới COMPLETED, đã lưu bản chụp kết quả)',
   })
   @ApiResponse({
     status: 200,
     description:
-      'Trả về giao dịch cũ nếu gửi lại cùng Idempotency Key (COMPLETED/REVERSED)',
+      'Phát lại (Replay): trả về đúng bản chụp kết quả (response_body snapshot) đã lưu',
   })
   @ApiResponse({
     status: 202,
     description:
-      'Giao dịch cùng Idempotency Key đang được xử lý (INITIATED/PENDING_OTP/PROCESSING)',
+      'Yêu cầu cùng Idempotency-Key đang được xử lý (IN_PROGRESS / PROCESSING)',
   })
   @ApiResponse({
     status: 400,
-    description: 'Thiếu header hoặc số tiền không hợp lệ',
+    description: 'Thiếu/sai định dạng header UUID hoặc số tiền không hợp lệ',
   })
   @ApiResponse({
     status: 409,
-    description: 'Trùng Idempotency Key nhưng khác payload hoặc khác loại GD',
+    description:
+      'Trùng Idempotency-Key nhưng khác nội dung yêu cầu (request_hash khác)',
   })
   @ApiResponse({
     status: 422,
-    description: 'Không đủ số dư khả dụng (ghi nhận FAILED)',
+    description: 'Không đủ số dư khả dụng (ghi nhận FAILED kèm bản chụp lỗi)',
   })
   @ApiResponse({
     status: 503,
@@ -218,7 +240,9 @@ export class TransactionsController {
   @Roles(UserRole.ADMIN)
   @ApiOperation({
     summary:
-      'Hoàn tiền một giao dịch COMPLETED bằng giao dịch REVERSAL mới (Chỉ Admin)',
+      'Hoàn tiền một giao dịch COMPLETED bằng giao dịch REVERSAL mới (Chỉ Admin, hỗ trợ Idempotency Snapshot)',
+    description:
+      'Yêu cầu quyền Admin và header Idempotency-Key (UUID, hạn dùng 24h). Nếu gửi lại cùng key và cùng nội dung, trả về đúng bản chụp kết quả hoàn tiền đã lưu.',
   })
   @ApiParam({
     name: 'id',
@@ -226,7 +250,7 @@ export class TransactionsController {
   })
   @ApiHeader({
     name: 'Idempotency-Key',
-    description: 'UUID để chống double-submit khi hoàn tiền',
+    description: IDEMPOTENCY_HEADER_DESC,
     required: true,
   })
   @ApiResponse({
@@ -237,11 +261,11 @@ export class TransactionsController {
   @ApiResponse({
     status: 200,
     description:
-      'Trả về giao dịch hoàn tiền cũ nếu gửi lại cùng Idempotency Key',
+      'Phát lại (Replay): trả về đúng bản chụp giao dịch hoàn tiền đã lưu',
   })
   @ApiResponse({
     status: 202,
-    description: 'Yêu cầu hoàn tiền cùng Idempotency Key đang được xử lý',
+    description: 'Yêu cầu hoàn tiền cùng Idempotency-Key đang được xử lý',
   })
   @ApiResponse({
     status: 403,
@@ -254,7 +278,7 @@ export class TransactionsController {
   @ApiResponse({
     status: 409,
     description:
-      'Giao dịch gốc không ở trạng thái COMPLETED, là REVERSAL, đã được hoàn tiền, hoặc trùng Idempotency Key khác nội dung',
+      'Giao dịch gốc không ở trạng thái COMPLETED, là REVERSAL, đã được hoàn tiền, hoặc trùng Idempotency-Key khác nội dung',
   })
   @ApiResponse({
     status: 422,

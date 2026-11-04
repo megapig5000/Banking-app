@@ -11,6 +11,10 @@ import {
   Transaction,
   TransactionStatus,
 } from '../src/database/entities/transaction.entity';
+import {
+  IdempotencyKey,
+  IdempotencyKeyStatus,
+} from '../src/database/entities/idempotency-key.entity';
 import { TransactionFailureCode } from '../src/transactions/transactions.constants';
 import { TransactionsService } from '../src/transactions/transactions.service';
 import {
@@ -274,13 +278,14 @@ describe('Module 3A (3.1 & 7.3) — Double-entry Ledger & Mid-Transaction Rollba
   });
 
   // =========================================================================
-  // BÀI 7.3 — TEST ROLLBACK KHI LỖI GIỮA CHỪNG (R1, R2 - CẬP NHẬT CHO MODULE 3B)
+  // BÀI 7.3 — TEST ROLLBACK KHI LỖI GIỮA CHỪNG (R1, R2 - CẬP NHẬT CHO MODULE 2 & 3B)
   // =========================================================================
 
-  it('R1: rolls back sender debit completely when an error occurs right after debitAccount and before creditAccount (records FAILED transaction with 0 ledger entries)', async () => {
+  it('R1: rolls back sender debit completely when an error occurs right after debitAccount and before creditAccount (records FAILED transaction & idempotency key with 0 ledger entries)', async () => {
     const httpServer = app.getHttpServer();
     const txRepo = dataSource.getRepository(Transaction);
     const ledgerRepo = dataSource.getRepository(LedgerEntry);
+    const idemRepo = dataSource.getRepository(IdempotencyKey);
 
     const sender = await createAuthenticatedAccount(
       app,
@@ -330,9 +335,17 @@ describe('Module 3A (3.1 & 7.3) — Double-entry Ledger & Mid-Transaction Rollba
     expect(meSender.body.balance).toBe('1000000.00');
     expect(meReceiver.body.balance).toBe('200000.00');
 
-    // 2. Có đúng 1 phiếu FAILED (INTERNAL_ERROR) được Pha C ghi nhận, nhưng 0 bút toán mới trong sổ cái
-    const failedTx = await txRepo.findOneByOrFail({
+    // 2. Dòng khóa trong idempotency_keys và phiếu giao dịch đều ở trạng thái FAILED, nhưng 0 bút toán mới
+    const idemRecord = await idemRepo.findOneByOrFail({
+      user_id: sender.userId,
       idempotency_key: failedKey,
+    });
+    expect(idemRecord.status).toBe(IdempotencyKeyStatus.FAILED);
+    expect(idemRecord.response_status).toBe(500);
+    expect(idemRecord.transaction_id).toBeDefined();
+
+    const failedTx = await txRepo.findOneByOrFail({
+      id: idemRecord.transaction_id!,
     });
     expect(failedTx.status).toBe(TransactionStatus.FAILED);
     expect(failedTx.failure_code).toBe(TransactionFailureCode.INTERNAL_ERROR);
@@ -341,10 +354,11 @@ describe('Module 3A (3.1 & 7.3) — Double-entry Ledger & Mid-Transaction Rollba
     await assertLedgerInvariants(dataSource);
   });
 
-  it('R2: rolls back Phase B completely (no orphaned DEBIT entry, records FAILED transaction) when an error occurs after inserting DEBIT ledger entry and before inserting CREDIT ledger entry', async () => {
+  it('R2: rolls back Phase B completely (no orphaned DEBIT entry, records FAILED transaction & idempotency key) when an error occurs after inserting DEBIT ledger entry and before inserting CREDIT ledger entry', async () => {
     const httpServer = app.getHttpServer();
     const txRepo = dataSource.getRepository(Transaction);
     const ledgerRepo = dataSource.getRepository(LedgerEntry);
+    const idemRepo = dataSource.getRepository(IdempotencyKey);
 
     const sender = await createAuthenticatedAccount(
       app,
@@ -417,8 +431,16 @@ describe('Module 3A (3.1 & 7.3) — Double-entry Ledger & Mid-Transaction Rollba
     expect(meReceiver.body.balance).toBe('200000.00');
 
     // 2. Có đúng 1 phiếu FAILED (INTERNAL_ERROR) và tuyệt đối không có bút toán DEBIT mồ côi nào trong DB
-    const failedTx = await txRepo.findOneByOrFail({
+    const idemRecord = await idemRepo.findOneByOrFail({
+      user_id: sender.userId,
       idempotency_key: failedKey,
+    });
+    expect(idemRecord.status).toBe(IdempotencyKeyStatus.FAILED);
+    expect(idemRecord.response_status).toBe(500);
+    expect(idemRecord.transaction_id).toBeDefined();
+
+    const failedTx = await txRepo.findOneByOrFail({
+      id: idemRecord.transaction_id!,
     });
     expect(failedTx.status).toBe(TransactionStatus.FAILED);
     expect(failedTx.failure_code).toBe(TransactionFailureCode.INTERNAL_ERROR);

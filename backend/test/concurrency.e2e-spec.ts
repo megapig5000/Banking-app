@@ -10,6 +10,10 @@ import {
 } from '../src/database/entities/transaction.entity';
 import { LedgerEntry } from '../src/database/entities/ledger-entry.entity';
 import {
+  IdempotencyKey,
+  IdempotencyKeyStatus,
+} from '../src/database/entities/idempotency-key.entity';
+import {
   assertLedgerInvariants,
   createAuthenticatedAccount,
   createTestApp,
@@ -211,6 +215,8 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
 
   it('T3: 5 concurrent requests with the SAME Idempotency-Key and payload -> only 1 transaction created, all responses in {201, 200, 202} with same transaction ID (5 iterations)', async () => {
     const httpServer = app.getHttpServer();
+    const txRepo = dataSource.getRepository(Transaction);
+    const idemRepo = dataSource.getRepository(IdempotencyKey);
     const iterations = 5;
 
     for (let round = 1; round <= iterations; round++) {
@@ -257,17 +263,33 @@ describe('Module 1 & 7.2 — Concurrency Integration Tests (e2e)', () => {
       expect(count201).toBe(1);
       expect(countReplay).toBe(4);
 
+      const winningRes = responses.find((r) => r.status === 201)!;
+
       // Cả 5 response phải trả về CÙNG một ID giao dịch
       const txIds = new Set(responses.map((r) => r.body.id));
       expect(txIds.size).toBe(1);
-      const createdTxId = responses[0].body.id as string;
+      const createdTxId = winningRes.body.id as string;
 
-      // Trong DB chỉ có đúng 1 bản ghi giao dịch với idempotency_key này và trạng thái cuối là COMPLETED
-      const dbTxs = await dataSource.getRepository(Transaction).find({
-        where: { idempotency_key: sharedKey },
+      // Trong bảng idempotency_keys chỉ có đúng 1 dòng khóa COMPLETED gắn với createdTxId
+      const keyRecords = await idemRepo.find({
+        where: { user_id: sender.userId, idempotency_key: sharedKey },
       });
-      expect(dbTxs).toHaveLength(1);
-      expect(dbTxs[0].status).toBe(TransactionStatus.COMPLETED);
+      expect(keyRecords).toHaveLength(1);
+      expect(keyRecords[0].status).toBe(IdempotencyKeyStatus.COMPLETED);
+      expect(keyRecords[0].transaction_id).toBe(createdTxId);
+
+      // Giao dịch tương ứng trong bảng transactions ở trạng thái COMPLETED
+      const dbTx = await txRepo.findOneByOrFail({ id: createdTxId });
+      expect(dbTx.status).toBe(TransactionStatus.COMPLETED);
+
+      // Gửi lại sau khi xong -> 200 OK kèm đúng bản chụp của lần 201
+      const postReplayRes = await request(httpServer)
+        .post('/api/transactions/transfer')
+        .set('Authorization', `Bearer ${sender.token}`)
+        .set('Idempotency-Key', sharedKey)
+        .send(payload)
+        .expect(200);
+      expect(postReplayRes.body).toEqual(winningRes.body);
 
       // Trong sổ cái chỉ có đúng 2 bút toán (1 DEBIT + 1 CREDIT) của giao dịch chuyển khoản này
       const txLedgerCount = await dataSource.getRepository(LedgerEntry).count({

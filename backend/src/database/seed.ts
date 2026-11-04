@@ -7,7 +7,6 @@ import {
   TransactionStatus,
 } from './entities/transaction.entity';
 import * as bcrypt from 'bcrypt';
-import { v4 as uuidv4 } from 'uuid';
 
 async function runSeed() {
   await AppDataSource.initialize();
@@ -166,7 +165,6 @@ async function runSeed() {
             type: TransactionType.DEPOSIT,
             status: TransactionStatus.COMPLETED,
             description: 'Số dư khởi tạo',
-            idempotency_key: uuidv4(),
             created_at: initialDepositDate,
             updated_at: initialDepositDate,
           }),
@@ -188,7 +186,6 @@ async function runSeed() {
             type: TransactionType.TRANSFER,
             status: TransactionStatus.COMPLETED,
             description: `Test transaction ${i + 1}`,
-            idempotency_key: uuidv4(),
             created_at: txDate,
             updated_at: txDate,
           }),
