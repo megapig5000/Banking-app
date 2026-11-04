@@ -5,6 +5,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { AuthModule } from './auth/auth.module';
 import { AccountsModule } from './accounts/accounts.module';
 import { TransactionsModule } from './transactions/transactions.module';
+import { IdempotencyModule } from './idempotency/idempotency.module';
 import { dataSourceOptions } from './database/data-source';
 
 @Module({
@@ -17,6 +18,7 @@ import { dataSourceOptions } from './database/data-source';
     TypeOrmModule.forRoot(dataSourceOptions),
     AuthModule,
     AccountsModule,
+    IdempotencyModule,
     TransactionsModule,
   ],
 })

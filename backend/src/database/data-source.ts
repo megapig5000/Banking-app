@@ -4,10 +4,12 @@ import { User } from './entities/user.entity';
 import { Account } from './entities/account.entity';
 import { Transaction } from './entities/transaction.entity';
 import { LedgerEntry } from './entities/ledger-entry.entity';
+import { IdempotencyKey } from './entities/idempotency-key.entity';
 import { Baseline1710000000000 } from './migrations/1710000000000-Baseline';
 import { AddDepositWithdrawAndIdempotencyScope1710000001000 } from './migrations/1710000001000-AddDepositWithdrawAndIdempotencyScope';
 import { CreateLedgerEntriesWithBackfillAndTrigger1710000002000 } from './migrations/1710000002000-CreateLedgerEntriesWithBackfillAndTrigger';
 import { UpgradeTransactionsStateMachineAndReversalSchema1710000003000 } from './migrations/1710000003000-UpgradeTransactionsStateMachineAndReversalSchema';
+import { CreateIdempotencyKeysAndDropTransactionIdempotencyColumn1710000004000 } from './migrations/1710000004000-CreateIdempotencyKeysAndDropTransactionIdempotencyColumn';
 
 const isTest = process.env.NODE_ENV === 'test';
 dotenv.config({ path: isTest ? '.env.test' : '.env', quiet: true });
@@ -24,12 +26,13 @@ export const dataSourceOptions: DataSourceOptions = {
   password: process.env.DB_PASSWORD || 'password',
   database:
     process.env.DB_NAME || (isTest ? 'simple_bank_test' : 'simple_bank'),
-  entities: [User, Account, Transaction, LedgerEntry],
+  entities: [User, Account, Transaction, LedgerEntry, IdempotencyKey],
   migrations: [
     Baseline1710000000000,
     AddDepositWithdrawAndIdempotencyScope1710000001000,
     CreateLedgerEntriesWithBackfillAndTrigger1710000002000,
     UpgradeTransactionsStateMachineAndReversalSchema1710000003000,
+    CreateIdempotencyKeysAndDropTransactionIdempotencyColumn1710000004000,
   ],
   synchronize: false,
 };

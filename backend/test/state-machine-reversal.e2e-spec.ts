@@ -13,10 +13,15 @@ import {
   LedgerEntryType,
 } from '../src/database/entities/ledger-entry.entity';
 import {
+  IdempotencyKey,
+  IdempotencyKeyStatus,
+} from '../src/database/entities/idempotency-key.entity';
+import {
   canTransition,
   TransactionFailureCode,
 } from '../src/transactions/transactions.constants';
 import { TransactionsService } from '../src/transactions/transactions.service';
+import { IdempotencyService } from '../src/idempotency/idempotency.service';
 import {
   assertLedgerInvariants,
   createAuthenticatedAccount,
@@ -31,12 +36,14 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
   let app: INestApplication<App>;
   let dataSource: DataSource;
   let transactionsService: TransactionsService;
+  let idempotencyService: IdempotencyService;
 
   beforeAll(async () => {
     const setup = await createTestApp();
     app = setup.app;
     dataSource = setup.dataSource;
     transactionsService = app.get(TransactionsService);
+    idempotencyService = app.get(IdempotencyService);
   });
 
   beforeEach(async () => {
@@ -101,6 +108,7 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
   it('ST2: service transition() rejects invalid state transition FAILED -> COMPLETED and keeps DB status unchanged', async () => {
     const httpServer = app.getHttpServer();
     const txRepo = dataSource.getRepository(Transaction);
+    const idemRepo = dataSource.getRepository(IdempotencyKey);
 
     const user = await createAuthenticatedAccount(app, 'ST2-User', '100000.00');
 
@@ -113,8 +121,12 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
       .send({ amount: '500000.00', description: 'ST2 failed withdraw' })
       .expect(422);
 
-    const failedTx = await txRepo.findOneByOrFail({
+    const idemRecord = await idemRepo.findOneByOrFail({
+      user_id: user.userId,
       idempotency_key: failKey,
+    });
+    const failedTx = await txRepo.findOneByOrFail({
+      id: idemRecord.transaction_id!,
     });
     expect(failedTx.status).toBe(TransactionStatus.FAILED);
 
@@ -142,9 +154,11 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
     const httpServer = app.getHttpServer();
     const txRepo = dataSource.getRepository(Transaction);
     const ledgerRepo = dataSource.getRepository(LedgerEntry);
+    const idemRepo = dataSource.getRepository(IdempotencyKey);
 
     const user = await createAuthenticatedAccount(app, 'F1-User', '100000.00');
     const ledgerCountBefore = await ledgerRepo.count();
+    const txCountBefore = await txRepo.count();
 
     const idempotencyKey = randomUUID();
     const payload = {
@@ -163,16 +177,23 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
     expect(res1.body.message).toBe('Không đủ số dư khả dụng');
 
     // 2. Có đúng 1 giao dịch FAILED với failure_code = INSUFFICIENT_BALANCE, 0 bút toán mới
-    const failedTxs = await txRepo.find({
-      where: { idempotency_key: idempotencyKey },
+    const idemRecord = await idemRepo.findOneByOrFail({
+      user_id: user.userId,
+      idempotency_key: idempotencyKey,
     });
-    expect(failedTxs).toHaveLength(1);
-    expect(failedTxs[0].status).toBe(TransactionStatus.FAILED);
-    expect(failedTxs[0].failure_code).toBe(
+    expect(idemRecord.status).toBe(IdempotencyKeyStatus.FAILED);
+    expect(idemRecord.response_status).toBe(422);
+
+    const failedTx = await txRepo.findOneByOrFail({
+      id: idemRecord.transaction_id!,
+    });
+    expect(failedTx.status).toBe(TransactionStatus.FAILED);
+    expect(failedTx.failure_code).toBe(
       TransactionFailureCode.INSUFFICIENT_BALANCE,
     );
 
     expect(await ledgerRepo.count()).toBe(ledgerCountBefore);
+    expect(await txRepo.count()).toBe(txCountBefore + 1);
 
     // 3. Gửi lại (Replay) cùng key -> trả về cùng 422 mà không tạo thêm bản ghi thứ hai
     const res2 = await request(httpServer)
@@ -183,9 +204,7 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
       .expect(422);
 
     expect(res2.body.message).toBe('Không đủ số dư khả dụng');
-    expect(
-      await txRepo.count({ where: { idempotency_key: idempotencyKey } }),
-    ).toBe(1);
+    expect(await txRepo.count()).toBe(txCountBefore + 1);
 
     // 4. Số dư vẫn giữ nguyên 100,000.00 và lịch sử có hiển thị dòng FAILED
     const meRes = await request(httpServer)
@@ -200,7 +219,7 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
       .expect(200);
 
     const failedInHistory = historyRes.body.data.find(
-      (item: any) => item.id === failedTxs[0].id,
+      (item: any) => item.id === failedTx.id,
     );
     expect(failedInHistory).toBeDefined();
     expect(failedInHistory.status).toBe(TransactionStatus.FAILED);
@@ -213,6 +232,7 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
     const httpServer = app.getHttpServer();
     const txRepo = dataSource.getRepository(Transaction);
     const ledgerRepo = dataSource.getRepository(LedgerEntry);
+    const idemRepo = dataSource.getRepository(IdempotencyKey);
 
     const sender = await createAuthenticatedAccount(
       app,
@@ -244,8 +264,15 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
 
     expect(res.body.message).toBe('Lỗi hệ thống khi thực hiện giao dịch');
 
-    const failedTx = await txRepo.findOneByOrFail({
+    const idemRecord = await idemRepo.findOneByOrFail({
+      user_id: sender.userId,
       idempotency_key: failKey,
+    });
+    expect(idemRecord.status).toBe(IdempotencyKeyStatus.FAILED);
+    expect(idemRecord.response_status).toBe(500);
+
+    const failedTx = await txRepo.findOneByOrFail({
+      id: idemRecord.transaction_id!,
     });
     expect(failedTx.status).toBe(TransactionStatus.FAILED);
     expect(failedTx.failure_code).toBe(TransactionFailureCode.INTERNAL_ERROR);
@@ -265,9 +292,10 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
   // P1 & P2 — REPLAY GIAO DỊCH ĐANG XỬ LÝ (202) & QUÉT GIAO DỊCH TREO
   // =========================================================================
 
-  it('P1: replaying a request with same Idempotency-Key and payload while transaction is PROCESSING returns 202 Accepted and leaves balance unchanged', async () => {
+  it('P1: replaying a request with same Idempotency-Key and payload while transaction is PROCESSING (and key is IN_PROGRESS) returns 202 Accepted and leaves balance unchanged', async () => {
     const httpServer = app.getHttpServer();
     const txRepo = dataSource.getRepository(Transaction);
+    const idemRepo = dataSource.getRepository(IdempotencyKey);
 
     const sender = await createAuthenticatedAccount(
       app,
@@ -281,16 +309,41 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
     );
 
     const processingKey = randomUUID();
+    const payload = {
+      toAccountNumber: receiver.accountNumber,
+      amount: '150000.00',
+      description: 'P1 in-flight transfer',
+    };
+
     const inFlightTx = await txRepo.save(
       txRepo.create({
         actor_account_id: sender.accountId,
         from_account_id: sender.accountId,
         to_account_id: receiver.accountId,
-        amount: '150000.00',
+        amount: payload.amount,
         type: TransactionType.TRANSFER,
         status: TransactionStatus.PROCESSING,
-        description: 'P1 in-flight transfer',
+        description: payload.description,
+      }),
+    );
+
+    const requestHash = idempotencyService.computeRequestHash({
+      operation: 'TRANSFER',
+      toAccountNumber: payload.toAccountNumber,
+      amount: payload.amount,
+      description: payload.description,
+    });
+
+    await idemRepo.save(
+      idemRepo.create({
+        user_id: sender.userId,
         idempotency_key: processingKey,
+        request_hash: requestHash,
+        status: IdempotencyKeyStatus.IN_PROGRESS,
+        response_status: null,
+        response_body: null,
+        transaction_id: inFlightTx.id,
+        expired_at: new Date(Date.now() + 24 * 3600 * 1000),
       }),
     );
 
@@ -299,11 +352,7 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
       .post('/api/transactions/transfer')
       .set('Authorization', `Bearer ${sender.token}`)
       .set('Idempotency-Key', processingKey)
-      .send({
-        toAccountNumber: receiver.accountNumber,
-        amount: '150000.00',
-        description: 'P1 in-flight transfer',
-      })
+      .send(payload)
       .expect(202);
 
     expect(replayRes.body.id).toBe(inFlightTx.id);
@@ -318,8 +367,9 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
     await assertLedgerInvariants(dataSource);
   });
 
-  it('P2: sweepStuckTransactions() marks old PROCESSING without ledger entries as FAILED/TIMEOUT, keeps fresh PROCESSING untouched, and logs error without modifying old PROCESSING that has ledger entries', async () => {
+  it('P2: sweepStuckTransactions() marks old PROCESSING without ledger entries (and its idempotency key) as FAILED/TIMEOUT, keeps fresh PROCESSING untouched, and logs error without modifying old PROCESSING that has ledger entries', async () => {
     const txRepo = dataSource.getRepository(Transaction);
+    const idemRepo = dataSource.getRepository(IdempotencyKey);
     const user = await createAuthenticatedAccount(app, 'P2-User', '500000.00');
 
     const oldDate = new Date(Date.now() - 300 * 1000); // 5 phút trước (> 120s)
@@ -335,13 +385,25 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
         type: TransactionType.WITHDRAW,
         status: TransactionStatus.PROCESSING,
         description: 'P2 old stuck without ledger',
-        idempotency_key: randomUUID(),
         created_at: oldDate,
       }),
     );
     await dataSource.query(
       `UPDATE "transactions" SET "updated_at" = $1 WHERE "id" = $2`,
       [oldDate, stuckNoLedger.id],
+    );
+
+    const stuckKeyRecord = await idemRepo.save(
+      idemRepo.create({
+        user_id: user.userId,
+        idempotency_key: randomUUID(),
+        request_hash: 'e'.repeat(64),
+        status: IdempotencyKeyStatus.IN_PROGRESS,
+        response_status: null,
+        response_body: null,
+        transaction_id: stuckNoLedger.id,
+        expired_at: new Date(Date.now() + 24 * 3600 * 1000),
+      }),
     );
 
     // 2. Phiếu PROCESSING mới tinh -> Phải giữ nguyên PROCESSING
@@ -354,7 +416,6 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
         type: TransactionType.WITHDRAW,
         status: TransactionStatus.PROCESSING,
         description: 'P2 fresh processing',
-        idempotency_key: randomUUID(),
         created_at: freshDate,
       }),
     );
@@ -369,7 +430,6 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
         type: TransactionType.WITHDRAW,
         status: TransactionStatus.PROCESSING,
         description: 'P2 anomaly old processing with ledger entry',
-        idempotency_key: randomUUID(),
         created_at: oldDate,
       }),
     );
@@ -400,6 +460,12 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
     const stuckAfter = await txRepo.findOneByOrFail({ id: stuckNoLedger.id });
     expect(stuckAfter.status).toBe(TransactionStatus.FAILED);
     expect(stuckAfter.failure_code).toBe(TransactionFailureCode.TIMEOUT);
+
+    const stuckKeyAfter = await idemRepo.findOneByOrFail({
+      id: stuckKeyRecord.id,
+    });
+    expect(stuckKeyAfter.status).toBe(IdempotencyKeyStatus.FAILED);
+    expect(stuckKeyAfter.response_status).toBe(503);
 
     const freshAfter = await txRepo.findOneByOrFail({ id: freshProcessing.id });
     expect(freshAfter.status).toBe(TransactionStatus.PROCESSING);
@@ -576,7 +642,7 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
       .send({ reason: 'Concurrent reversal' })
       .expect(200);
 
-    expect(replayRes.body.id).toBe(winningResult.body.id);
+    expect(replayRes.body).toEqual(winningResult.body);
 
     // Trong DB chỉ có đúng 1 bản ghi REVERSAL ở trạng thái COMPLETED cho giao dịch gốc này
     const completedReversals = await txRepo.count({
@@ -594,6 +660,7 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
   it('V3: when receiver has spent the funds, reversal fails with 422 (REVERSAL_INSUFFICIENT_BALANCE), original stays COMPLETED, and reversal succeeds later once receiver deposits funds', async () => {
     const httpServer = app.getHttpServer();
     const txRepo = dataSource.getRepository(Transaction);
+    const idemRepo = dataSource.getRepository(IdempotencyKey);
 
     const admin = await createAuthenticatedAdmin(app, dataSource, 'V3-Admin');
     const userA = await createAuthenticatedAccount(app, 'V3-A', '500000.00');
@@ -632,8 +699,15 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
     const origAfterFail = await txRepo.findOneByOrFail({ id: tfRes.body.id });
     expect(origAfterFail.status).toBe(TransactionStatus.COMPLETED);
 
-    const failedRev = await txRepo.findOneByOrFail({
+    const firstRevKeyRecord = await idemRepo.findOneByOrFail({
+      user_id: admin.userId,
       idempotency_key: firstRevKey,
+    });
+    expect(firstRevKeyRecord.status).toBe(IdempotencyKeyStatus.FAILED);
+    expect(firstRevKeyRecord.response_status).toBe(422);
+
+    const failedRev = await txRepo.findOneByOrFail({
+      id: firstRevKeyRecord.transaction_id!,
     });
     expect(failedRev.status).toBe(TransactionStatus.FAILED);
     expect(failedRev.failure_code).toBe(
@@ -668,6 +742,8 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
 
   it('V4: enforces RBAC (customer gets 403) and rejects reversing FAILED, already REVERSED, or REVERSAL transactions with 409', async () => {
     const httpServer = app.getHttpServer();
+    const txRepo = dataSource.getRepository(Transaction);
+    const idemRepo = dataSource.getRepository(IdempotencyKey);
 
     const admin = await createAuthenticatedAdmin(app, dataSource, 'V4-Admin');
     const userA = await createAuthenticatedAccount(app, 'V4-A', '500000.00');
@@ -702,9 +778,13 @@ describe('Module 3B (3.2 & 5.3) — State Machine, Stuck Sweep & Reversal (e2e)'
       .send({ amount: '9999999.00', description: 'V4 failed withdraw' })
       .expect(422);
 
-    const failedTx = await dataSource
-      .getRepository(Transaction)
-      .findOneByOrFail({ idempotency_key: failedKey });
+    const failedKeyRecord = await idemRepo.findOneByOrFail({
+      user_id: userA.userId,
+      idempotency_key: failedKey,
+    });
+    const failedTx = await txRepo.findOneByOrFail({
+      id: failedKeyRecord.transaction_id!,
+    });
 
     await request(httpServer)
       .post(`/api/transactions/${failedTx.id}/reverse`)

@@ -38,54 +38,63 @@ sequenceDiagram
     end
 ```
 
-## 2. Transaction & Double-Entry Ledger Flow — 3 Phases (Transfer / Deposit / Withdraw)
+## 2. Transaction, Idempotency Snapshot & Double-Entry Ledger Flow — 3 Phases (Transfer / Deposit / Withdraw)
 
-> **Ghi chú về Luồng 3 Pha (Pha A → Pha B → Pha C):**
-> * **Pha A (Transaction ngắn 1):** Kiểm tra đầu vào (400/404), tra `Idempotency-Key` (nếu đã tồn tại: `COMPLETED/REVERSED -> 200`, `PROCESSING -> 202`, `FAILED -> lỗi cũ`, khác payload -> `409`), sau đó `INSERT` giao dịch ở trạng thái `INITIATED`, gọi `transition(INITIATED -> PROCESSING)` và `COMMIT` ngay.
-> * **Pha B (Transaction chính 2 — có Deadlock Retry):** Khóa tài khoản bằng `SELECT ... FOR UPDATE OF "account"` theo `ORDER BY account.id ASC`, kiểm tra nghiệp vụ/số dư, trừ/cộng tiền (`RETURNING balance`), chèn bút toán `ledger_entries` và gọi `transition(PROCESSING -> COMPLETED)` trong **cùng một transaction** trước khi `COMMIT`.
-> * **Pha C (Transaction ngắn 3 — khi Pha B lỗi):** Sau khi Pha B đã `ROLLBACK` hoàn toàn (số dư và sổ cái không đổi), mở transaction mới gọi `transition(PROCESSING -> FAILED, { failureCode })` rồi `COMMIT` và trả lỗi HTTP tương ứng cho client.
+> **Ghi chú về Luồng 3 Pha kết hợp Bảng `idempotency_keys` (Module 2 + 3A + 3B):**
+> * **Pha A (Transaction ngắn 1):** Kiểm tra đầu vào, chuẩn hóa dữ liệu và băm SHA-256 (`request_hash`), xóa dòng khóa cũ đã hết hạn (`expired_at <= NOW() AND status <> 'IN_PROGRESS'`), rồi chạy `INSERT INTO idempotency_keys (status = 'IN_PROGRESS', ...) ON CONFLICT (user_id, idempotency_key) DO NOTHING RETURNING *`.
+>   * Nếu **không chèn được** (khóa đã tồn tại): đọc dòng khóa cũ ngay trong transaction → nếu khác `request_hash` trả `409`; nếu `COMPLETED` trả `200 OK` kèm bản chụp `response_body`; nếu `FAILED` trả lại đúng lỗi đã lưu; nếu `IN_PROGRESS` trả `202 Accepted`.
+>   * Nếu **chèn được** (khóa mới): kiểm tra tài khoản đích (`404`/`400`), tạo phiếu `Transaction` (`INITIATED → PROCESSING`), gắn `transaction_id` vào dòng khóa và `COMMIT`.
+> * **Pha B (Transaction chính 2 — có Deadlock Retry):** Khóa tài khoản bằng `SELECT ... FOR UPDATE OF "account"` theo `ORDER BY account.id ASC`, trừ/cộng tiền (`RETURNING balance`), chèn bút toán `ledger_entries`, đóng dấu giao dịch `PROCESSING → COMPLETED`, và gọi `completeInTransaction()` chuyển dòng `idempotency_keys` sang `COMPLETED` kèm bản chụp `response_body` (`201`) trong **cùng một transaction** trước khi `COMMIT`.
+> * **Pha C (Transaction ngắn 3 — khi Pha B lỗi):** Sau khi Pha B đã `ROLLBACK` hoàn toàn (số dư và sổ cái không đổi), mở transaction mới đóng dấu giao dịch `PROCESSING → FAILED` (`failure_code`) và đóng dấu dòng `idempotency_keys` sang `FAILED` kèm bản chụp lỗi trước khi `COMMIT`.
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Controller as TransactionsController
     participant Service as TransactionsService
+    participant Idem as IdempotencyService
     participant Repo as Repository / EntityManager (TypeORM)
     participant DB as PostgreSQL
 
     Client->>Controller: POST /api/transactions/transfer | deposit | withdraw (Idempotency-Key)
     Controller->>Controller: Validate JWT, UUID Header & DTO
     Controller->>Service: transfer / deposit / withdraw(userId, idempotencyKey, dto)
+    Service->>Idem: computeRequestHash(normalizedPayload)
 
     rect rgb(240, 248, 255)
-        Note over Service,DB: PHA A — Tạo phiếu giao dịch (Transaction ngắn 1)
+        Note over Service,DB: PHA A — Chiếm khóa Idempotency & Tạo phiếu giao dịch (Transaction ngắn 1)
         Service->>Repo: startTransaction()
-        Service->>Repo: findOne(Account by userId) & findExistingByIdempotencyKey()
-        Repo->>DB: SELECT * FROM transactions WHERE idempotency_key = $1 AND actor_account_id = $2
-        DB-->>Repo: existingTx | null
+        Service->>Repo: findOne(Account by userId)
+        Service->>Idem: beginIdempotency(manager, userId, idempotencyKey, requestHash)
+        Idem->>DB: DELETE FROM idempotency_keys WHERE user_id=$1 AND idempotency_key=$2 AND expired_at <= NOW() AND status <> 'IN_PROGRESS'
+        Idem->>DB: INSERT INTO idempotency_keys (IN_PROGRESS, request_hash, expired_at) ON CONFLICT (user_id, idempotency_key) DO NOTHING RETURNING *
+        DB-->>Idem: insertedRows[]
 
-        alt Idempotency Key Already Exists (or 23505 on INSERT)
+        alt Key Already Exists (insertedRows.length === 0)
+            Idem->>DB: SELECT * FROM idempotency_keys WHERE user_id = $1 AND idempotency_key = $2
+            DB-->>Idem: existingRecord
             Service->>Repo: rollbackTransaction()
-            alt Payload Mismatch
+            alt existingRecord.request_hash !== requestHash
                 Service-->>Controller: throw ConflictException (409)
-            else Status is COMPLETED or REVERSED
-                Service-->>Controller: { statusCode: 200, transaction }
-            else Status is INITIATED / PENDING_OTP / PROCESSING
-                Service-->>Controller: { statusCode: 202, transaction }
-            else Status is FAILED
-                Service-->>Controller: throw Original Failure Exception (422 / 503 / 500)
+            else existingRecord.status === COMPLETED
+                Service-->>Controller: { statusCode: 200, transaction: existingRecord.response_body }
+            else existingRecord.status === FAILED
+                Service-->>Controller: throw HttpException(existingRecord.response_body, existingRecord.response_status)
+            else existingRecord.status === IN_PROGRESS
+                Service-->>Controller: { statusCode: 202, transaction: currentProcessingTx }
             end
-        else New Request (Valid Destination & Not Self-Transfer)
-            Service->>Repo: save(Transaction status = INITIATED)
-            Repo->>DB: INSERT INTO transactions (status = 'INITIATED', ...)
-            Service->>Repo: transition(id, INITIATED -> PROCESSING)
-            Repo->>DB: UPDATE transactions SET status = 'PROCESSING', updated_at = now() WHERE id = $1 AND status = 'INITIATED'
+        else New Key (insertedRows.length === 1)
+            Service->>Repo: Validate destination account (404 / 400 self-transfer -> rollback both tx & key)
+            Service->>Repo: save(Transaction status = INITIATED) & transition(INITIATED -> PROCESSING)
+            Repo->>DB: INSERT INTO transactions & UPDATE status = 'PROCESSING'
+            Service->>Idem: attachTransactionId(manager, record.id, savedTx.id)
+            Idem->>DB: UPDATE idempotency_keys SET transaction_id = $1 WHERE id = $2
             Service->>Repo: commitTransaction()
         end
     end
 
     rect rgb(240, 255, 240)
-        Note over Service,DB: PHA B — Xử lý tiền, Sổ cái & Đóng dấu COMPLETED (Transaction chính 2)
+        Note over Service,DB: PHA B — Xử lý tiền, Sổ cái & Lưu Bản chụp COMPLETED (Transaction chính 2)
         Service->>Repo: startTransaction() & SET LOCAL lock_timeout = '5s'
         Service->>Repo: loadAccountsForTransaction()
         Repo->>DB: SELECT account, user FROM accounts JOIN users ORDER BY account.id ASC FOR UPDATE OF account
@@ -110,8 +119,12 @@ sequenceDiagram
 
         Service->>Repo: transition(id, PROCESSING -> COMPLETED)
         Repo->>DB: UPDATE transactions SET status = 'COMPLETED', updated_at = now() WHERE id = $1 AND status = 'PROCESSING'
+
+        Service->>Idem: completeInTransaction(manager, idempotencyRecordId, 201, snapshot)
+        Idem->>DB: UPDATE idempotency_keys SET status = 'COMPLETED', response_status = 201, response_body = $2 WHERE id = $1 AND status = 'IN_PROGRESS'
+
         Service->>Repo: commitTransaction()
-        Service-->>Controller: { statusCode: 201, transaction }
+        Service-->>Controller: { statusCode: 201, transaction: snapshot }
         Controller-->>Client: 201 Created
     end
 
@@ -122,6 +135,8 @@ sequenceDiagram
             Service->>Repo: startTransaction() (New short transaction for Phase C)
             Service->>Repo: transition(id, PROCESSING -> FAILED, { failureCode })
             Repo->>DB: UPDATE transactions SET status = 'FAILED', failure_code = $2, updated_at = now() WHERE id = $1 AND status = 'PROCESSING'
+            Service->>Idem: failInTransaction(manager, idempotencyRecordId, errorStatus, errorBody)
+            Idem->>DB: UPDATE idempotency_keys SET status = 'FAILED', response_status = $2, response_body = $3 WHERE id = $1 AND status = 'IN_PROGRESS'
             Service->>Repo: commitTransaction()
             Service-->>Controller: throw Mapped HTTP Exception (422 / 503 / 500)
             Controller-->>Client: HTTP Error Response
@@ -136,74 +151,50 @@ sequenceDiagram
     participant Client as Admin Client
     participant Controller as TransactionsController (JwtAuthGuard + RolesGuard)
     participant Service as TransactionsService
+    participant Idem as IdempotencyService
     participant Repo as Repository / EntityManager (TypeORM)
     participant DB as PostgreSQL
 
     Client->>Controller: POST /api/transactions/:id/reverse (Bearer Admin JWT, Idempotency-Key)
     Controller->>Controller: Verify JWT & RolesGuard (req.user.role === 'admin', else 403)
     Controller->>Service: reverseTransaction(adminUserId, originalTxId, idempotencyKey, dto)
+    Service->>Idem: computeRequestHash({ operation: 'REVERSE', originalTransactionId, reason })
 
     rect rgb(240, 248, 255)
-        Note over Service,DB: PHA A — Kiểm tra giao dịch gốc & Tạo phiếu REVERSAL
+        Note over Service,DB: PHA A — Chiếm khóa Idempotency của Admin & Tạo phiếu REVERSAL
         Service->>Repo: startTransaction()
-        Service->>Repo: findOne(originalTx by id) & findExistingByIdempotencyKey()
-        Repo->>DB: SELECT * FROM transactions WHERE id = $1
-        DB-->>Repo: originalTx
+        Service->>Idem: beginIdempotency(manager, adminUserId, idempotencyKey, requestHash)
+        Idem->>DB: INSERT INTO idempotency_keys ... ON CONFLICT (user_id, idempotency_key) DO NOTHING RETURNING *
 
-        alt Original Tx Not Found
+        alt Key Already Exists for Admin
             Service->>Repo: rollbackTransaction()
-            Service-->>Controller: throw NotFoundException (404)
-        else Original Tx is REVERSAL or status !== COMPLETED (and not Replay)
-            Service->>Repo: rollbackTransaction()
-            Service-->>Controller: throw ConflictException (409)
-        else Valid COMPLETED Original Tx
-            Service->>Repo: save(Transaction type = REVERSAL, status = INITIATED, original_transaction_id = originalTx.id)
-            Repo->>DB: INSERT INTO transactions (checked by Partial Unique Index IDX_transactions_active_reversal_original)
-            alt Concurrent Active Reversal Exists (Error 23505 on original_transaction_id)
-                DB-->>Repo: Unique Violation 23505
-                Service->>Repo: rollbackTransaction()
-                Service-->>Controller: throw ConflictException (409)
-            else Insert OK
-                Service->>Repo: transition(reversalTx.id, INITIATED -> PROCESSING)
+            Service-->>Controller: Replay saved snapshot (200 / 202 / saved error) or 409 if hash mismatch
+        else New Key
+            Service->>Repo: findOne(originalTx by id)
+            alt Original Tx Not Found (404) or status !== COMPLETED / type === REVERSAL (409)
+                Service->>Repo: rollbackTransaction() (Also rolls back IN_PROGRESS idempotency key)
+                Service-->>Controller: throw 404 or 409
+            else Valid COMPLETED Original Tx
+                Service->>Repo: save(Transaction type = REVERSAL, status = INITIATED) & transition(INITIATED -> PROCESSING)
+                Service->>Idem: attachTransactionId(manager, record.id, savedReversal.id)
                 Service->>Repo: commitTransaction()
             end
         end
     end
 
     rect rgb(240, 255, 240)
-        Note over Service,DB: PHA B — Đảo bút toán, Đóng dấu REVERSAL COMPLETED & Gốc REVERSED
+        Note over Service,DB: PHA B — Đảo bút toán, Đóng dấu REVERSAL COMPLETED, Gốc REVERSED & Lưu Snapshot
         Service->>Repo: startTransaction() & SET LOCAL lock_timeout = '5s'
         Service->>Repo: find(LedgerEntry where transaction_id = originalTx.id)
-        Repo->>DB: SELECT * FROM ledger_entries WHERE transaction_id = $1 ORDER BY id ASC
-        DB-->>Repo: originalEntries[]
-
         Service->>Repo: Lock involved accounts ORDER BY account.id ASC FOR UPDATE OF account
-        Repo->>DB: SELECT * FROM accounts WHERE id IN (...) ORDER BY id ASC FOR UPDATE
-        DB-->>Repo: lockedAccounts[]
-
         Service->>Service: Check sufficient balance on accounts to be debited (original CREDIT entries)
-
-        loop For each originalEntry in originalEntries
-            alt originalEntry.type === CREDIT
-                Service->>Repo: debitAccount(account_id, amount) -> RETURNING balance
-                Repo->>DB: UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance >= $1 RETURNING balance
-            else originalEntry.type === DEBIT
-                Service->>Repo: creditAccount(account_id, amount) -> RETURNING balance
-                Repo->>DB: UPDATE accounts SET balance = balance + $1 WHERE id = $2 RETURNING balance
-            end
-        end
-
+        Service->>Repo: Debit & Credit inverse amounts (RETURNING balance)
         Service->>Repo: insertLedgerEntries(inverseEntries[])
-        Repo->>DB: INSERT INTO ledger_entries (DEBIT <-> CREDIT)
-
         Service->>Repo: transition(reversalTx.id, PROCESSING -> COMPLETED)
-        Repo->>DB: UPDATE transactions SET status = 'COMPLETED', updated_at = now() WHERE id = $1 AND status = 'PROCESSING'
-
         Service->>Repo: transition(originalTx.id, COMPLETED -> REVERSED)
-        Repo->>DB: UPDATE transactions SET status = 'REVERSED', updated_at = now() WHERE id = $1 AND status = 'COMPLETED'
-
+        Service->>Idem: completeInTransaction(manager, idempotencyRecordId, 201, snapshot)
         Service->>Repo: commitTransaction()
-        Service-->>Controller: { statusCode: 201, transaction: completedReversal }
+        Service-->>Controller: { statusCode: 201, transaction: snapshot }
         Controller-->>Client: 201 Created
     end
 
@@ -213,7 +204,7 @@ sequenceDiagram
             Service->>Repo: rollbackTransaction() (Original Tx remains COMPLETED, balances unchanged)
             Service->>Repo: startTransaction()
             Service->>Repo: transition(reversalTx.id, PROCESSING -> FAILED, { failureCode: REVERSAL_INSUFFICIENT_BALANCE })
-            Repo->>DB: UPDATE transactions SET status = 'FAILED', failure_code = 'REVERSAL_INSUFFICIENT_BALANCE' WHERE id = $1
+            Service->>Idem: failInTransaction(manager, idempotencyRecordId, 422, errorBody)
             Service->>Repo: commitTransaction()
             Service-->>Controller: throw UnprocessableEntityException (422)
             Controller-->>Client: 422 Unprocessable Entity (Can retry with new key once receiver tops up)

@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
-import { api } from "@/services/api";
+import { api, submitIdempotentTransaction } from "@/services/api";
 
 type TransactionType = "TRANSFER" | "DEPOSIT" | "WITHDRAW" | "REVERSAL";
 type TransactionStatus =
@@ -73,10 +73,14 @@ export default function TransferPage() {
   });
   const [idempotencyKey, setIdempotencyKey] = useState(() => uuidv4());
   const [loading, setLoading] = useState(false);
+  const [retryStatus, setRetryStatus] = useState<string | null>(null);
   const [message, setMessage] = useState<{
-    type: "success" | "error" | "info" | "";
+    type: "success" | "error" | "warning" | "";
     text: string;
   }>({ type: "", text: "" });
+
+  // Cờ khóa đồng bộ bằng useRef để chặn bấm đúp trong cùng một tích tắc trước khi React kịp re-render
+  const inFlightRef = useRef(false);
 
   const [account, setAccount] = useState<Account | null>(null);
   const [recentTransactions, setRecentTransactions] = useState<
@@ -119,6 +123,7 @@ export default function TransferPage() {
   const handleChange = (
     e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
   ) => {
+    if (inFlightRef.current) return;
     setFormData({ ...formData, [e.target.name]: e.target.value });
     setIdempotencyKey(uuidv4());
     setMessage({ type: "", text: "" });
@@ -126,27 +131,43 @@ export default function TransferPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // Chặn ngay lần bấm thứ hai trong cùng tích tắc bằng cờ đồng bộ useRef
+    if (inFlightRef.current) {
+      return;
+    }
+    inFlightRef.current = true;
     setLoading(true);
+    setRetryStatus(null);
     setMessage({ type: "", text: "" });
 
     try {
-      const res = await api.post("/transactions/transfer", formData, {
-        headers: { "Idempotency-Key": idempotencyKey },
-      });
+      const result = await submitIdempotentTransaction<TransactionItem>(
+        "/transactions/transfer",
+        formData,
+        idempotencyKey,
+        (attempt, maxRetries) => {
+          setRetryStatus(`Đang thử lại (lần ${attempt}/${maxRetries})...`);
+        },
+      );
 
-      // Nếu nhận 202 Accepted (đang xử lý PROCESSING): giữ nguyên Idempotency-Key
-      if (res.status === 202) {
+      // Nếu hết số lần thử lại mà vẫn chưa biết kết quả (timeout/mất mạng/202 kéo dài):
+      // Trả về trạng thái "chưa xác định" và GIỮ NGUYÊN idempotencyKey để bấm gửi lại an toàn!
+      if (result.outcome === "indeterminate") {
+        const txHint = result.lastTransactionId
+          ? ` (Mã GD tạm thời: ${result.lastTransactionId})`
+          : "";
         setMessage({
-          type: "info",
-          text: `Giao dịch đang được xử lý, vui lòng kiểm tra lại sau. Mã GD: ${res.data.id}`,
+          type: "warning",
+          text: `Chưa xác nhận được giao dịch${txHint}. Vui lòng kiểm tra Lịch sử giao dịch trước khi thử lại, hoặc bấm Xác nhận chuyển khoản để kiểm tra lại với cùng mã giao dịch.`,
         });
-        await fetchAccountAndRecentTransactions();
+        void fetchAccountAndRecentTransactions();
         return;
       }
 
       setMessage({
         type: "success",
-        text: `Chuyển khoản thành công! Mã GD: ${res.data.id}`,
+        text: `Chuyển khoản thành công! Mã GD: ${result.data.id}`,
       });
       setFormData({ toAccountNumber: "", amount: "", description: "" });
       // Phản hồi kết thúc thành công (201/200) -> sinh Idempotency-Key mới
@@ -155,8 +176,7 @@ export default function TransferPage() {
       await fetchAccountAndRecentTransactions();
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
-        // Nếu server đã trả về phản hồi lỗi cuối cùng (4xx/5xx) -> sinh Idempotency-Key mới
-        // Nếu lỗi mạng (!err.response) -> giữ nguyên key để retry an toàn
+        // Khi có err.response (server đã trả về lỗi cuối cùng 4xx/5xx): sinh Idempotency-Key mới
         if (err.response) {
           setIdempotencyKey(uuidv4());
           void fetchAccountAndRecentTransactions();
@@ -166,13 +186,15 @@ export default function TransferPage() {
           type: "error",
           text: Array.isArray(msg)
             ? msg[0]
-            : msg || "Không thể kết nối tới máy chủ, vui lòng thử lại",
+            : msg || "Không thể thực hiện giao dịch, vui lòng thử lại",
         });
       } else {
         setMessage({ type: "error", text: "Lỗi hệ thống" });
       }
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
+      setRetryStatus(null);
     }
   };
 
@@ -226,13 +248,20 @@ export default function TransferPage() {
           Chuyển khoản nội bộ
         </h2>
 
+        {retryStatus && (
+          <div className="mb-4 p-4 rounded-md bg-blue-50 border border-blue-200 text-blue-800 text-sm font-medium">
+            {retryStatus} Hệ thống đang giữ nguyên mã giao dịch để đảm bảo không
+            trừ tiền hai lần.
+          </div>
+        )}
+
         {message.text && (
           <div
             className={`mb-4 p-4 rounded-md ${
               message.type === "success"
                 ? "bg-green-100 text-green-800"
-                : message.type === "info"
-                  ? "bg-blue-100 text-blue-800"
+                : message.type === "warning"
+                  ? "bg-amber-100 text-amber-900 border border-amber-300"
                   : "bg-red-100 text-red-800"
             }`}
           >
@@ -249,7 +278,8 @@ export default function TransferPage() {
               type="text"
               name="toAccountNumber"
               required
-              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900"
+              disabled={loading}
+              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900 disabled:bg-gray-100"
               value={formData.toAccountNumber}
               onChange={handleChange}
               placeholder="VD: 1000000002"
@@ -265,7 +295,8 @@ export default function TransferPage() {
               required
               min="1"
               step="0.01"
-              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900"
+              disabled={loading}
+              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900 disabled:bg-gray-100"
               value={formData.amount}
               onChange={handleChange}
               placeholder="VD: 50000"
@@ -279,7 +310,8 @@ export default function TransferPage() {
               name="description"
               maxLength={200}
               rows={3}
-              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900"
+              disabled={loading}
+              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900 disabled:bg-gray-100"
               value={formData.description}
               onChange={handleChange}
             ></textarea>
@@ -289,7 +321,9 @@ export default function TransferPage() {
             disabled={loading}
             className="w-full bg-blue-600 text-white p-3 rounded-md font-semibold hover:bg-blue-700 disabled:opacity-50 transition"
           >
-            {loading ? "Đang thực hiện..." : "Xác nhận chuyển khoản"}
+            {loading
+              ? retryStatus || "Đang thực hiện..."
+              : "Xác nhận chuyển khoản"}
           </button>
         </form>
       </div>
