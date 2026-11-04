@@ -1,17 +1,20 @@
 # Sequence Diagrams
 
-## 1. Authentication Flow (Login)
+## 1. Authentication Flow & Login Audit (`POST /api/auth/login`)
 
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Controller as AuthController
+    participant MW as RequestContextMiddleware
+    participant Controller as AuthController + AuditInterceptor
     participant Service as AuthService
     participant Repo as UserRepository (TypeORM)
+    participant Audit as AuditService
     participant DB as PostgreSQL
     participant Bcrypt
 
-    Client->>Controller: POST /api/auth/login {email, password}
+    Client->>MW: POST /api/auth/login {email, password}
+    MW->>Controller: requestContextStorage.run({ req })
     Controller->>Service: login(dto)
     Service->>Repo: findOne({email})
     Repo->>DB: SELECT * FROM users WHERE email = $1
@@ -21,18 +24,24 @@ sequenceDiagram
     alt Email not found or Wrong Password
         Service->>Bcrypt: compare(password, hash)
         Bcrypt-->>Service: false
-        Service-->>Controller: throw UnauthorizedException
-        Controller-->>Client: 401 Unauthorized
+        Service-->>Controller: throw UnauthorizedException (401)
+        Controller->>Audit: recordAuditLogBestEffort(AUTH_LOGIN_FAILED, actor=null, email)
+        Audit->>DB: INSERT INTO audit_logs (action='AUTH_LOGIN_FAILED', ...)
+        Controller-->>Client: 401 Unauthorized (error re-thrown)
     else Correct Password
         Service->>Bcrypt: compare(password, hash)
         Bcrypt-->>Service: true
 
         alt User is Locked
-            Service-->>Controller: throw ForbiddenException
-            Controller-->>Client: 403 Forbidden
+            Service-->>Controller: throw ForbiddenException (403)
+            Controller->>Audit: recordAuditLogBestEffort(AUTH_LOGIN_FAILED, actor=null, email)
+            Audit->>DB: INSERT INTO audit_logs (action='AUTH_LOGIN_FAILED', ...)
+            Controller-->>Client: 403 Forbidden (error re-thrown)
         else User is Active
             Service->>Service: sign JWT(payload: { sub: user.id })
             Service-->>Controller: { accessToken, user }
+            Controller->>Audit: recordAuditLogBestEffort(AUTH_LOGIN_SUCCESS, actor=user.id)
+            Audit->>DB: INSERT INTO audit_logs (action='AUTH_LOGIN_SUCCESS', ...)
             Controller-->>Client: 200 OK + JWT
         end
     end
@@ -149,14 +158,14 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Client as Admin Client
-    participant Controller as TransactionsController (JwtAuthGuard + RolesGuard)
+    participant Controller as TransactionsController (JwtAuthGuard + RolesGuard + AuditInterceptor)
     participant Service as TransactionsService
     participant Idem as IdempotencyService
     participant Repo as Repository / EntityManager (TypeORM)
     participant DB as PostgreSQL
 
     Client->>Controller: POST /api/transactions/:id/reverse (Bearer Admin JWT, Idempotency-Key)
-    Controller->>Controller: Verify JWT & RolesGuard (req.user.role === 'admin', else 403)
+    Controller->>Controller: Verify JWT & RolesGuard (req.user.role === 'ADMIN', else 403)
     Controller->>Service: reverseTransaction(adminUserId, originalTxId, idempotencyKey, dto)
     Service->>Idem: computeRequestHash({ operation: 'REVERSE', originalTransactionId, reason })
 
@@ -195,6 +204,7 @@ sequenceDiagram
         Service->>Idem: completeInTransaction(manager, idempotencyRecordId, 201, snapshot)
         Service->>Repo: commitTransaction()
         Service-->>Controller: { statusCode: 201, transaction: snapshot }
+        Controller->>DB: AuditInterceptor records TRANSACTION_REVERSED in audit_logs
         Controller-->>Client: 201 Created
     end
 
@@ -207,7 +217,74 @@ sequenceDiagram
             Service->>Idem: failInTransaction(manager, idempotencyRecordId, 422, errorBody)
             Service->>Repo: commitTransaction()
             Service-->>Controller: throw UnprocessableEntityException (422)
+            Controller->>DB: AuditInterceptor records TRANSACTION_REVERSED (outcome=ERROR)
             Controller-->>Client: 422 Unprocessable Entity (Can retry with new key once receiver tops up)
+        end
+    end
+```
+
+## 4. Admin Lock/Unlock User & Transactional Audit Subscriber Flow (`PATCH /api/admin/users/:id/status`)
+
+```mermaid
+sequenceDiagram
+    participant Client as Admin Client
+    participant MW as RequestContextMiddleware
+    participant Guard as JwtAuthGuard + RolesGuard
+    participant Controller as AdminController
+    participant Service as AdminService
+    participant Repo as EntityManager (TypeORM)
+    participant Sub as UserAuditSubscriber
+    participant DB as PostgreSQL
+
+    Client->>MW: PATCH /api/admin/users/:id/status { status: "locked" }
+    MW->>Guard: requestContextStorage.run({ req })
+    Guard->>DB: SELECT * FROM users WHERE id = payload.sub
+    DB-->>Guard: currentAdminUser (role = 'ADMIN', status = 'active')
+
+    alt Not Authenticated (401) or Role !== 'ADMIN' (403)
+        Guard-->>Client: 401 Unauthorized / 403 Forbidden
+    else Valid ADMIN
+        Guard->>Controller: req.user = currentAdminUser
+        Controller->>Service: updateUserStatus(adminUserId, targetUserId, dto)
+
+        alt adminUserId === targetUserId (Self-Lock Prevention)
+            Service-->>Controller: throw BadRequestException (400)
+            Controller-->>Client: 400 Bad Request
+        else Valid Target User ID
+            rect rgb(240, 255, 240)
+                Note over Service,DB: Single Database Transaction (User Update + Audit Log Insert)
+                Service->>Repo: dataSource.transaction(async manager => ...)
+                Repo->>DB: BEGIN
+                Service->>Repo: manager.findOne(User, { where: { id: targetUserId }, relations: { accounts: true } })
+                Repo->>DB: SELECT user, account FROM users LEFT JOIN accounts WHERE user.id = $1
+                DB-->>Repo: targetUser (status = 'active')
+                Repo->>Sub: afterLoad(targetUser) -> WeakMap captures beforeSnapshot { status: 'active', ... }
+
+                alt targetUser.status === dto.status (No Change)
+                    Service->>Repo: COMMIT (No save() called, 0 audit logs created)
+                    Service-->>Controller: mappedUser
+                    Controller-->>Client: 200 OK
+                else Status Changed ('active' -> 'locked')
+                    Service->>Service: targetUser.status = 'locked'
+                    Service->>Repo: manager.save(User, targetUser)
+                    Repo->>DB: UPDATE users SET status = 'locked' WHERE id = $1
+                    Repo->>Sub: afterUpdate(event) (inside same transaction)
+                    Sub->>Sub: Compare WeakMap beforeSnapshot ('active') vs afterSnapshot ('locked')
+                    Sub->>Sub: Read actorId, ipAddress, userAgent from AsyncLocalStorage (lazy read)
+                    Sub->>Repo: event.manager.insert(AuditLog, { action: 'USER_STATUS_CHANGED', before_data: {status:'active'}, after_data: {status:'locked'} })
+                    Repo->>DB: INSERT INTO audit_logs (...)
+
+                    alt Transaction Succeeds
+                        Service->>Repo: COMMIT (Both users.status and audit_logs committed atomically)
+                        Service-->>Controller: mappedUser
+                        Controller-->>Client: 200 OK
+                    else Any Error Before Commit
+                        Service->>Repo: ROLLBACK (Both users.status update and audit_logs insert rolled back 100%)
+                        Service-->>Controller: throw Error (500)
+                        Controller-->>Client: 500 Internal Server Error
+                    end
+                end
+            end
         end
     end
 ```

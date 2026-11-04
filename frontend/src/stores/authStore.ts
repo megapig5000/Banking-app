@@ -1,12 +1,15 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
-interface User {
+export type UserRole = "CUSTOMER" | "ADMIN";
+export type UserStatus = "active" | "locked";
+
+export interface User {
   id: string;
   fullName: string;
   email: string;
-  role: string;
-  status: string;
+  role: UserRole;
+  status: UserStatus;
 }
 
 interface AuthState {
