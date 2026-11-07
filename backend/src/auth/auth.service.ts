@@ -27,8 +27,10 @@ export class AuthService {
   async register(registerDto: RegisterDto) {
     const { fullName, email, password } = registerDto;
 
+    // Kiểm tra trùng email tính cả bản ghi đã xóa mềm (email của user đã xóa mềm vẫn bị giữ chỗ -> 409)
     const existingUser = await this.userRepository.findOne({
       where: { email },
+      withDeleted: true,
     });
     if (existingUser) {
       throw new ConflictException('Email đã tồn tại');
@@ -50,7 +52,7 @@ export class AuthService {
       });
       const savedUser = await queryRunner.manager.save(user);
 
-      // 2. Tạo bank account ngẫu nhiên 10 số (logic tránh trùng lặp)
+      // 2. Tạo bank account ngẫu nhiên 10 số (tránh trùng cả với tài khoản đã xóa mềm)
       let accountNumber = '';
       let isUnique = false;
       let attempts = 0;
@@ -61,6 +63,7 @@ export class AuthService {
         ).toString();
         const existingAcc = await queryRunner.manager.findOne(Account, {
           where: { account_number: accountNumber },
+          withDeleted: true,
         });
         if (!existingAcc) isUnique = true;
         attempts++;
@@ -87,6 +90,7 @@ export class AuthService {
         id: savedUser.id,
         fullName: savedUser.full_name,
         email: savedUser.email,
+        phone: savedUser.phone ?? null,
         role: savedUser.role,
         status: savedUser.status,
       };
@@ -101,6 +105,7 @@ export class AuthService {
   async login(loginDto: LoginDto) {
     const { email, password } = loginDto;
 
+    // Mặc định loại trừ user đã xóa mềm -> trả 401 như người không tồn tại
     const user = await this.userRepository.findOne({ where: { email } });
     if (!user) {
       throw new UnauthorizedException('Email hoặc mật khẩu không đúng');
@@ -124,6 +129,7 @@ export class AuthService {
         id: user.id,
         fullName: user.full_name,
         email: user.email,
+        phone: user.phone ?? null,
         role: user.role,
         status: user.status,
       },

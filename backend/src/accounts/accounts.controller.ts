@@ -17,10 +17,14 @@ export class AccountsController {
   constructor(private readonly accountsService: AccountsService) {}
 
   @Get('me')
-  @ApiOperation({ summary: 'Lấy thông tin tài khoản ngân hàng của bản thân' })
+  @ApiOperation({
+    summary:
+      'Lấy thông tin tài khoản ngân hàng của bản thân (kèm status, tier, holdAmount, availableBalance, limits)',
+  })
   @ApiResponse({
     status: 200,
-    description: 'Trả về thông tin Account của mình',
+    description:
+      'Trả về thông tin Account của mình (bao gồm trạng thái, hạng tài khoản, số tiền giữ chỗ, số dư khả dụng và khối hạn mức giao dịch trong ngày)',
   })
   @ApiResponse({ status: 401, description: 'Chưa đăng nhập hoặc token sai' })
   @ApiResponse({
@@ -43,7 +47,8 @@ export class AccountsController {
   })
   @ApiResponse({
     status: 200,
-    description: 'Trả về thông tin Account',
+    description:
+      'Trả về thông tin Account (bao gồm status, tier, holdAmount, availableBalance và khối limits)',
   })
   @ApiResponse({
     status: 401,

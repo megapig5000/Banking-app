@@ -1,148 +1,192 @@
 # Architecture Decision Records (ADR)
 
-## ADR-001: Why NestJS + PostgreSQL + TypeORM
-* **Context**: Cần chọn stack backend cho ứng dụng ngân hàng đáp ứng yêu cầu kiến trúc phân tầng rõ ràng và đảm bảo tính toàn vẹn dữ liệu giao dịch.
-* **Decision**: Sử dụng NestJS (TypeScript) làm backend framework, TypeORM làm ORM và PostgreSQL làm hệ quản trị cơ sở dữ liệu.
-* **Reason**: NestJS cung cấp sẵn kiến trúc module hóa (`Controller -> Service -> Repository`) và tích hợp sẵn `ValidationPipe`, Guard, Interceptor, Swagger. TypeORM hỗ trợ tốt quản lý Database Transaction (`QueryRunner`), Entity Subscriber và Migration. PostgreSQL tuân thủ chuẩn ACID và hỗ trợ tốt kiểu số thập phân chính xác (`numeric`).
-* **Trade-offs**: Cấu hình khởi đầu của NestJS và TypeORM Migration nhiều bước hơn so với ExpressJS thuần, nhưng giúp mã nguồn nhất quán và dễ mở rộng.
+Tài liệu này ghi lại các quyết định kiến trúc cốt lõi của dự án **Simple Banking App** từ phiên bản nền tảng (Core v1.0), giai đoạn chuẩn bị mở rộng (Phase 0), đến các module nâng cao: Concurrency & Locking (Module 1), Sổ cái kép (Module 3A), Vòng đời giao dịch & Hoàn tiền (Module 3B), Chống trùng lặp giao dịch (Module 2), Phân quyền RBAC & Nhật ký kiểm toán (Module 4A), và Hạn mức, Trạng thái tài khoản & Xóa mềm (Module 5).
 
-## ADR-002: Why numeric(18,2)
-* **Context**: Cần chọn kiểu dữ liệu lưu trữ và tính toán số tiền (`balance`, `amount`) cho tiền tệ VND.
-* **Decision**: Sử dụng `numeric(18,2)` trong PostgreSQL, truyền và trả dữ liệu qua JSON dưới dạng `string` (ví dụ `"50000.00"`), chuẩn hóa số thập phân bằng xử lý chuỗi, so sánh ở ứng dụng bằng số nguyên `BigInt` (đơn vị xu) và thực hiện cộng/trừ trực tiếp bằng biểu thức SQL trong PostgreSQL.
-* **Reason**: Kiểu `float` hoặc `double` (IEEE 754) bị sai số làm tròn dấu phẩy động, không được phép dùng trong ứng dụng tài chính. `numeric(18,2)` lưu trữ chính xác tuyệt đối tới từng xu và chịu được giá trị lên tới hàng triệu tỷ đồng.
-* **Trade-offs**: TypeORM ánh xạ cột `numeric` thành `string` trong TypeScript nên cần validate định dạng bằng regex `^\d{1,16}(\.\d{1,2})?$` ở DTO và bắt lỗi tràn số (`22003`) ở tầng database.
+---
 
-## ADR-003: Why 3-Phase Transaction Flow + Pessimistic Lock + Atomic Conditional Update + In-Transaction Ledger & Idempotency Snapshot
-* **Context**: Các thao tác biến động số dư (`TRANSFER`, `DEPOSIT`, `WITHDRAW`, `REVERSAL`) cần vừa lưu lại dấu vết phiếu giao dịch khi thất bại (`FAILED`), vừa lưu bản chụp kết quả Idempotency, vừa đảm bảo tuyệt đối không để lại dữ liệu tiền hay bút toán dở dang khi lỗi giữa chừng hoặc khi có nhiều request chạy đồng thời.
-* **Decision**: Thực hiện giao dịch theo **Luồng 3 Pha** kết hợp bảo vệ đa lớp:
-  1. **Pha A (Khởi tạo phiếu & Khóa — Transaction ngắn 1):** Kiểm tra đầu vào, xóa khóa cũ đã hết hạn, chèn dòng `idempotency_keys` (`status = 'IN_PROGRESS'`) bằng `INSERT ... ON CONFLICT (user_id, idempotency_key) DO NOTHING RETURNING *`. Nếu là khóa mới: tạo bản ghi giao dịch ở trạng thái `INITIATED`, chuyển sang `PROCESSING`, gắn `transaction_id` vào dòng khóa và `COMMIT` ngay.
-  2. **Pha B (Xử lý tiền, Sổ cái & Chụp biên nhận — Transaction chính 2):**
-     * Khóa các dòng tài khoản liên quan bằng `SELECT ... FOR UPDATE OF "account"` theo `ORDER BY account.id ASC`.
-     * Trừ/cộng tiền bằng câu lệnh nguyên tử có điều kiện (`UPDATE accounts SET balance = balance ∓ :amount WHERE id = :id [AND balance >= :amount] RETURNING balance`) để lấy ngay `balance_after`.
-     * Ghi các bút toán vào `ledger_entries`, đóng dấu giao dịch `PROCESSING → COMPLETED` (kèm `COMPLETED → REVERSED` cho giao dịch gốc nếu là hoàn tiền), và đóng dấu dòng `idempotency_keys` từ `IN_PROGRESS → COMPLETED` (kèm `response_status = 201` và `response_body` snapshot) trong **cùng một Database Transaction** trước khi `COMMIT`.
-  3. **Pha C (Ghi nhận thất bại — Transaction ngắn 3):** Nếu Pha B gặp lỗi và đã `ROLLBACK` hoàn toàn (số dư và sổ cái không đổi), mở transaction mới đóng dấu giao dịch `PROCESSING → FAILED` kèm `failure_code` và đóng dấu dòng `idempotency_keys` sang `FAILED` kèm bản chụp lỗi rồi `COMMIT`.
-* **Reason**: Đảm bảo mọi biến động số dư, bút toán sổ cái, con dấu `COMPLETED` của giao dịch và bản chụp kết quả của khóa Idempotency luôn thành công hoặc hủy bỏ cùng nhau 100%.
-* **Trade-offs**: Mỗi giao dịch mới đi qua 2 transaction ngắn (Pha A và Pha B, hoặc Pha A và Pha C), đổi lại trạng thái vòng đời giao dịch và khóa chống trùng luôn nhất quán tuyệt đối.
+## ADR-001: Lựa chọn Monorepo kết hợp Docker Compose
+- **Context:** Dự án bao gồm Backend (NestJS), Frontend (Next.js) và Database (PostgreSQL), cần chạy đồng bộ và dễ dàng kiểm thử chỉ với một lệnh duy nhất.
+- **Decision:** Tổ chức mã nguồn theo cấu trúc Monorepo (`/backend`, `/frontend`, `/docs`, `/scripts`) và đóng gói toàn bộ dịch vụ bằng `docker-compose.yml`.
+- **Reason:** Giúp đồng bộ phiên bản mã nguồn giữa Backend và Frontend, đơn giản hóa việc thiết lập môi trường phát triển và chạy kiểm thử tích hợp (`postgres-test`).
+- **Trade-offs:** Thời gian build image lần đầu lâu hơn so với chạy rời từng dịch vụ trên máy host, nhưng đổi lại tính nhất quán môi trường đạt 100%.
 
-## ADR-004: Why Dedicated `idempotency_keys` Table Instead of a Column on `transactions`
-* **Context**: Khi mạng chậm, mất kết nối hoặc timeout, trình duyệt hoặc người dùng có thể gửi lặp lại cùng một yêu cầu giao dịch, dẫn đến nguy cơ trừ/cộng tiền hai lần. Ở các phiên bản đầu (v5 → Module 3B), khóa chống trùng được lưu tạm ở cột `transactions.idempotency_key`.
-* **Decision**: Nâng cấp từ cột trên bảng `transactions` sang bảng **`idempotency_keys`** chuyên biệt (và xóa cột `transactions.idempotency_key`). Bắt buộc client gửi header `Idempotency-Key` (UUID) cho mọi API tạo giao dịch (`transfer`, `deposit`, `withdraw`, `reverse`). Khi gửi lại cùng key (cùng `user_id`) trong thời hạn 24 giờ:
-  * Khác `request_hash` (khác nội dung hoặc khác loại thao tác): trả `409 Conflict`.
-  * Khóa ở trạng thái `COMPLETED`: trả `200 OK` kèm đúng **bản chụp kết quả (`response_body` snapshot)** đã lưu lúc hoàn tất.
-  * Khóa ở trạng thái `FAILED`: trả lại đúng `response_status` và `response_body` lỗi đã lưu mà không chạy lại.
-  * Khóa ở trạng thái `IN_PROGRESS`: trả `202 Accepted` kèm trạng thái hiện tại của giao dịch.
-* **Reason**: Tách bảng riêng giúp lưu được mã băm yêu cầu (`request_hash`), bản chụp kết quả (`response_body`), thời hạn sống 24 giờ (`expired_at`) để dọn dẹp định kỳ mà không ảnh hưởng tới bảng lịch sử `transactions` vĩnh viễn.
-* **Trade-offs**: Thêm một bảng trong cơ sở dữ liệu và cần job dọn dẹp khóa hết hạn định kỳ.
+---
 
-## ADR-005: Why Next.js + Zustand
-* **Context**: Cần xây dựng giao diện ReactJS cho trình duyệt desktop có quản lý trạng thái đăng nhập, bảo vệ route và đóng gói Docker gọn nhẹ.
-* **Decision**: Sử dụng Next.js (App Router) ở chế độ Client Component (`'use client'`) kết hợp với Zustand (`persist` middleware) và Axios.
-* **Reason**: Next.js cung cấp cơ chế định tuyến theo thư mục rõ ràng và chế độ build `output: 'standalone'` giúp chạy container nhẹ. Zustand tối giản, dễ sử dụng.
-* **Trade-offs**: Cần chờ cờ `hydrated` của Zustand trước khi kiểm tra redirect ở `ProtectedLayout` để tránh nháy trang khi tải lại.
+## ADR-002: Xác thực Stateless JWT kết hợp Kiểm tra Trạng thái từ Database mỗi Request
+- **Context:** Cần cơ chế xác thực đơn giản, chuẩn mực cho REST API nhưng vẫn phải đảm bảo khi tài khoản người dùng bị khóa (`locked`) hoặc bị xóa mềm (`deleted_at IS NOT NULL`), mọi phiên đang mở phải bị chặn ngay lập tức.
+- **Decision:** Sử dụng JWT Access Token (thời hạn 1 giờ) chỉ chứa `{ sub: user.id }`. Tại `JwtStrategy.validate()`, hệ thống truy vấn bảng `users` trong PostgreSQL ở mỗi request để kiểm tra sự tồn tại (`deleted_at IS NULL`), trạng thái `user.status !== 'locked'` và nạp `user.role` mới nhất.
+- **Reason:** Tuân thủ nguyên tắc K.I.S.S (không cần Redis Blacklist phức tạp) mà vẫn đảm bảo thu hồi quyền truy cập hoặc cập nhật vai trò/trạng thái khóa tức thì.
+- **Trade-offs:** Phát sinh 1 câu truy vấn `SELECT` theo khóa chính `users.id` ở mỗi request cần xác thực, nhưng truy vấn theo PK UUID trên PostgreSQL có độ trễ cực thấp (< 1ms).
 
-## ADR-006: Why Input Sanitization / XSS Protection
-* **Context**: Dữ liệu văn bản do người dùng nhập (`fullName`, `description`, `reason`) có thể chứa các thẻ HTML/script độc hại gây lỗi XSS.
-* **Decision**: Validate bằng `class-validator` (`whitelist: true`, `forbidNonWhitelisted: true`), sanitize các ký tự `<`, `>`, `&` bằng hàm `sanitizeHtml` trước khi lưu vào DB, và tận dụng auto-escaping của React JSX ở Frontend.
-* **Reason**: Phòng thủ ở cả đầu vào và đầu ra mà không cần cài thêm thư viện nặng.
-* **Trade-offs**: Access Token lưu trong `localStorage` đòi hỏi kiểm soát chặt XSS và giới hạn thời hạn token (`1h`).
+---
 
-## ADR-007: Why TypeORM Migrations Instead of Synchronize
-* **Context**: Khi mở rộng sang các bài tập nâng cao (thêm `CHECK` constraint, đổi tên/thêm giá trị enum, thêm bảng sổ cái kép kèm backfill, trigger, partial unique index, bảng `idempotency_keys` và bảng `audit_logs`), `synchronize: true` không thể kiểm soát thứ tự chuyển đổi dữ liệu.
-* **Decision**: Tắt hoàn toàn `synchronize: true` (`synchronize: false` trong `data-source.ts`) và quản lý mọi thay đổi schema qua TypeORM Migrations.
-* **Reason**: Mọi thay đổi cấu trúc DB đều tường minh, có phiên bản trên Git, hỗ trợ rollback (`down`) và ánh xạ dữ liệu cũ an toàn.
-* **Trade-offs**: Mỗi khi sửa Entity phải tạo và chạy file migration tương ứng.
+## ADR-003: Luồng Giao dịch 3 Pha, Khóa Bi quan, Kiểm tra Trạng thái/Hạn mức/Khả dụng và Ghi Sổ cái Nguyên tử
+- **Context:** Giao dịch chuyển tiền, nạp tiền, rút tiền và hoàn tiền đòi hỏi tính toàn vẹn tuyệt đối (ACID): không mất cập nhật khi nhiều request chạy song song, không âm số dư khả dụng, không vượt hạn mức, mọi biến động số dư đều phải có bút toán sổ cái đối ứng và mọi giao dịch thất bại ở bước xử lý tiền đều phải lưu vết `FAILED`.
+- **Decision:** Thực thi các giao dịch tài chính theo **Luồng 3 Pha (3-Phase Transaction Flow)**:
+  1. **Pha A (Khởi tạo phiếu & Đăng ký khóa Idempotency — Transaction ngắn):** Kiểm tra điều kiện đầu vào (400/404), xóa khóa Idempotency cũ đã hết hạn (nếu có), thực hiện `INSERT INTO idempotency_keys ... ON CONFLICT DO NOTHING` (`IN_PROGRESS`), tạo bản ghi `transactions` ở trạng thái `INITIATED`, chuyển qua `transition(INITIATED -> PROCESSING)`, gắn `transaction_id` vào dòng khóa và `COMMIT` ngay.
+  2. **Pha B (Xử lý tiền, Kiểm tra Trạng thái/Hạn mức/Khả dụng, Ghi Sổ cái & Lưu Snapshot — Transaction chính, có bọc Deadlock Retry):** Đặt `SET LOCAL lock_timeout = '5s'`, khóa dòng các tài khoản liên quan bằng `SELECT ... FOR UPDATE OF "account" ORDER BY account.id ASC`. Dưới khóa dòng, kiểm tra tuần tự: (1) trạng thái người dùng (`user.status`), (2) trạng thái tài khoản (`account.status === 'ACTIVE'`), (3) hạn mức mỗi lần và mỗi ngày theo giờ Việt Nam (đối với `TRANSFER`/`WITHDRAW`), (4) số dư khả dụng (`balance - hold_amount >= amount`). Sau đó cập nhật số dư bằng biểu thức SQL `UPDATE accounts SET balance = balance - :amount WHERE id = :id AND status = 'ACTIVE' AND deleted_at IS NULL AND (balance - hold_amount) >= :amount RETURNING balance`, chèn các bút toán vào `ledger_entries`, đóng dấu `transition(PROCESSING -> COMPLETED)`, và cập nhật `idempotency_keys` sang `COMPLETED` kèm bản chụp `response_body` trong **cùng một Database Transaction**.
+  3. **Pha C (Ghi nhận `FAILED` khi Pha B lỗi):** Sau khi Pha B đã `ROLLBACK` hoàn toàn (số dư và sổ cái không đổi), mở một transaction ngắn mới gọi `transition(PROCESSING -> FAILED, { failureCode })` và đóng dấu dòng `idempotency_keys` sang `FAILED` kèm bản chụp lỗi chuẩn rồi trả lỗi tương ứng cho client.
+- **Reason:** Tách Pha A giúp phiếu giao dịch và khóa `idempotency_keys` tồn tại bền vững trước khi động vào tiền; gom việc kiểm tra trạng thái tài khoản, hạn mức, số dư khả dụng, trừ/cộng tiền, ghi sổ cái, đóng dấu `COMPLETED` và lưu bản chụp `idempotency_keys` vào cùng một transaction ở Pha B đảm bảo "tiền chỉ nhích khi sổ cái, con dấu `COMPLETED` và sổ ghi nhớ khóa cùng được đóng".
+- **Trade-offs:** Mỗi giao dịch thành công đi qua 2 transaction (Pha A và Pha B), nhưng Pha A cực ngắn và không giữ khóa tài khoản nên không làm giảm thông lượng hệ thống.
 
-## ADR-008: Why Single-Sided Cash Transactions & `actor_account_id` Tracking
-* **Context**: Cần quyết định cách lưu `from_account_id` / `to_account_id` cho `DEPOSIT`, `WITHDRAW` và ghi nhận tài khoản khởi tạo giao dịch.
-* **Decision**: Chọn **mô hình giao dịch một phía** (`DEPOSIT`: `from = NULL, to = NOT NULL`; `WITHDRAW`: `from = NOT NULL, to = NULL`) kèm `CHECK` constraint `CHK_transactions_type_accounts`, và lưu cột `actor_account_id` để định danh tài khoản chủ động thực hiện giao dịch. (Từ Module 2, phạm vi khóa Idempotency được chuyển sang bảng `idempotency_keys` theo `(user_id, idempotency_key)`).
-* **Reason**: Không cần tạo tài khoản hệ thống ảo bị âm quỹ, giữ cho mọi tài khoản trong bảng `accounts` luôn có số dư không âm (`>= 0`).
-* **Trade-offs**: Bảng `transactions` có cột `actor_account_id` tách biệt với `from_account_id` / `to_account_id`.
+---
 
-## ADR-009: Why Pessimistic Locking, Canonical Lock Ordering by ID, and Deadlock Retry
-* **Context**: Cần chống Lost Update khi nhiều request rút/chuyển tiền cùng lúc và chống Deadlock (`40P01`) khi chuyển khoản hai chiều A↔B.
-* **Decision**: Dùng Pessimistic Locking (`.setLock('pessimistic_write', undefined, ['account'])`) kèm `SET LOCAL lock_timeout = '5s'`, khóa các tài khoản theo thứ tự cố định `ORDER BY account.id ASC`, và bọc vòng lặp `executeWithDeadlockRetry` (tối đa 3 lần retry khi gặp `40P01`) quanh Pha B.
-* **Reason**: Benchmark Bài 1.3 & 1.4 chứng minh Pessimistic Locking đạt `100/100` request thành công ở kịch bản tranh chấp cao S2 (~275 req/s, `0` lỗi `503`), và `ORDER BY account.id ASC` giảm số lần deadlock khi chuyển khoản chéo A↔B về `0`.
-* **Trade-offs**: Các request chạm vào cùng một tài khoản phải xếp hàng tuần tự trong giới hạn `lock_timeout = '5s'`.
+## ADR-004: Chống gửi trùng giao dịch bằng Bảng `idempotency_keys` độc lập
+- **Context:** Khi mạng chập chờn, client timeout hoặc người dùng bấm nút nhiều lần, cùng một yêu cầu giao dịch có thể được gửi lặp lại. Ở phiên bản đầu, khóa chống trùng chỉ là một cột trên bảng `transactions` nên không lưu được bản chụp phản hồi (response snapshot), không có thời hạn sống (TTL) và không kiểm tra được mã băm chuẩn hóa của yêu cầu.
+- **Decision:** Tách cơ chế chống trùng ra bảng **`idempotency_keys`** độc lập (và xóa cột `transactions.idempotency_key`), bắt buộc client gửi header `Idempotency-Key` (UUID) cho cả 4 endpoint: `/transfer`, `/deposit`, `/withdraw`, `/reverse`.
+- **Reason:** Cho phép quản lý vòng đời khóa độc lập (`IN_PROGRESS`, `COMPLETED`, `FAILED`), lưu chính xác mã HTTP (`response_status`) cùng bản chụp JSON (`response_body`), cô lập không gian khóa theo từng người dùng (`UNIQUE (user_id, idempotency_key)`) và tự động dọn dẹp khóa hết hạn sau 24 giờ.
+- **Trade-offs:** Cần thêm 1 bảng trong Database và bước cập nhật trạng thái khóa trong Pha A / Pha B / Pha C, nhưng giải quyết triệt để bài toán phát lại kết quả chuẩn mực của hệ thống tài chính.
 
-## ADR-010: Why Append-Only Double-Entry Ledger, Database Immutability Trigger, `BIGSERIAL` Primary Key, and Cached Account Balance
-* **Context**: Cần lưu vết biến động số dư (`balance_after`) không thể sửa/xóa và đảm bảo số dư hiển thị luôn khớp với lịch sử kế toán.
-* **Decision**: Tạo bảng `ledger_entries` với khóa chính `id` kiểu `BIGSERIAL` (`@PrimaryGeneratedColumn({ type: 'bigint' })`), lấy `balance_after` trực tiếp từ `UPDATE ... RETURNING balance`, chặn `UPDATE`/`DELETE` bằng Trigger `trg_ledger_entries_immutable`, và giữ `accounts.balance` làm bản sao đọc nhanh (cached balance) đối chiếu với nguồn sự thật là tổng `ledger_entries`.
-* **Reason**: `id` tự tăng kết hợp khóa `FOR UPDATE` đảm bảo thứ tự ghi sổ khớp tuyệt đối với trình tự biến động số dư; Trigger bảo vệ dữ liệu ngay cả trước các câu lệnh SQL trực tiếp.
-* **Trade-offs**: Superuser vẫn có thể tắt trigger và `TRUNCATE` mức bảng không kích hoạt trigger mức dòng (được dùng để dọn DB test); production nên kết hợp thêm `REVOKE UPDATE, DELETE, TRUNCATE`.
+---
 
-## ADR-011: Why Transaction State Machine, 3-Phase Execution, Recording `FAILED` with Failure Codes, and Stuck Transaction Sweeping
-* **Context**:
-  1. Khi giao dịch thất bại ở bước kiểm tra số dư (`422`) hoặc hết thời gian chờ khóa (`503`), hệ thống cần lưu lại bản ghi `FAILED` kèm mã lý do để tra cứu và kiểm toán, nhưng tuyệt đối không được làm thay đổi tiền hay sổ cái.
-  2. Nếu ứng dụng bị sập nguồn đột ngột giữa lúc đang xử lý giao dịch, cần cơ chế phát hiện và đóng dấu các giao dịch bị "treo" (`PROCESSING` quá lâu).
-* **Decision**:
-  1. **Máy trạng thái hữu hạn (`ALLOWED_STATUS_TRANSITIONS` & `transition()`):** Định nghĩa 6 trạng thái viết HOA (`INITIATED`, `PENDING_OTP`, `PROCESSING`, `COMPLETED`, `FAILED`, `REVERSED`) và chỉ cho phép đổi trạng thái qua hàm `transition()` duy nhất bằng câu lệnh nguyên tử có điều kiện `UPDATE transactions SET status = :to, updated_at = now() WHERE id = :id AND status = :from`.
-  2. **Tách Luồng 3 Pha (Pha A → Pha B → Pha C):** Pha A tạo phiếu `INITIATED → PROCESSING` (cùng dòng khóa `IN_PROGRESS`) và `COMMIT` trước; Pha B khóa tài khoản, cập nhật số dư, ghi sổ cái và đóng dấu `PROCESSING → COMPLETED` trong cùng một transaction; nếu Pha B lỗi và rollback, Pha C mở transaction mới đóng dấu `PROCESSING → FAILED` kèm `failure_code` chuẩn hóa từ `FAILURE_CODE_MAP`.
-  3. **Quét giao dịch treo định kỳ (`sweepStuckTransactions` với `@nestjs/schedule`):** Cron job chạy mỗi phút tìm các giao dịch `PROCESSING` có `updated_at` cũ hơn `STUCK_AFTER_SECONDS = 120s`. Nếu giao dịch chưa có bút toán nào trong `ledger_entries`, đóng dấu `PROCESSING → FAILED` (`failure_code = TIMEOUT`) và đóng luôn dòng khóa `idempotency_keys` tương ứng sang `FAILED` (`503`); nếu phát hiện đã có bút toán (dị thường trái thiết kế), ghi log `ERROR` và giữ nguyên để kiểm tra thủ công.
-* **Reason**:
-  * Commit Pha A trước giúp mọi giao dịch bước vào giai đoạn xử lý tiền đều có định danh và dấu vết rõ ràng trong DB.
-  * Việc đóng dấu `PROCESSING → COMPLETED` nằm chung transaction với bước trừ/cộng tiền và ghi sổ cái ở Pha B đảm bảo **một phiếu đang ở `PROCESSING` chắc chắn chưa từng làm thay đổi tiền hay sổ cái**, do đó job quét giao dịch treo có thể đóng dấu `FAILED/TIMEOUT` an toàn mà không cần thực hiện hoàn tiền.
-* **Trade-offs**:
-  * Các lỗi yêu cầu đầu vào không hợp lệ trước khi lập phiếu (`400 DTO sai`, `404 tài khoản đích không tồn tại`, `400 tự chuyển cho chính mình`) được từ chối và rollback ngay ở Pha A nên không lưu vào DB.
+## ADR-005: Lưu trữ và Tính toán Tiền tệ chính xác bằng `numeric(18,2)` và Chuỗi Decimal / `BigInt`
+- **Context:** Phép tính số thực dấu chấm động (`Number` / IEEE 754) trong JavaScript bị sai số làm tròn (ví dụ `0.1 + 0.2 !== 0.3`), rất nguy hiểm cho ứng dụng ngân hàng.
+- **Decision:** Lưu mọi cột tiền tệ (`accounts.balance`, `accounts.hold_amount`, `transactions.amount`, `ledger_entries.amount`, `ledger_entries.balance_after`) bằng kiểu `numeric(18,2)` trong PostgreSQL; truyền nhận qua API dưới dạng `string`; chuẩn hóa số thập phân bằng xử lý chuỗi thuần túy và so sánh số dư / hạn mức bằng `BigInt` (quy đổi ra xu) hoặc biểu thức SQL.
+- **Reason:** Loại bỏ 100% sai số dấu chấm động ở cả tầng ứng dụng lẫn tầng cơ sở dữ liệu.
+- **Trade-offs:** Cần bước chuyển đổi chuỗi sang `BigInt` khi so sánh ở tầng Service và định dạng hiển thị ở Frontend.
 
-## ADR-012: Why Reversal Transactions with Inverse Ledger Entries, 3-Layer Double-Reversal Prevention, and Uppercase Enum Migration
-* **Context**:
-  1. Khi cần hủy hoặc hoàn tiền một giao dịch đã `COMPLETED`, hệ thống tài chính không được phép `UPDATE` số tiền hay `DELETE` giao dịch/bút toán cũ.
-  2. Cần ngăn chặn tuyệt đối việc một giao dịch gốc bị hoàn tiền hai lần (kể cả khi nhiều Admin bấm hoàn tiền đồng thời), nhưng vẫn phải cho phép thử lại nếu lần hoàn tiền trước thất bại do bên nhận tạm thời thiếu số dư.
-* **Decision**:
-  1. **Hoàn tiền bằng giao dịch `REVERSAL` mới và đảo từng bút toán gốc (`DEBIT ↔ CREDIT`):** Endpoint `POST /api/transactions/:id/reverse` (bảo vệ bởi `RolesGuard` kiểm tra `user.role === 'ADMIN'` từ DB) tạo một giao dịch mới có `type = 'REVERSAL'`, `original_transaction_id = gốc`, đảo chiều `from_account_id ↔ to_account_id`, và đảo ngược từng dòng `ledger_entries` của giao dịch gốc. Trong cùng transaction Pha B, đóng dấu `REVERSAL: PROCESSING → COMPLETED` và đóng dấu giao dịch gốc `COMPLETED → REVERSED`.
-  2. **Ba lớp chống hoàn tiền hai lần:** (1) Kiểm tra trạng thái gốc phải là `COMPLETED` ở Pha A; (2) Partial Unique Index `IDX_transactions_active_reversal_original` (`WHERE type = 'REVERSAL' AND status IN ('INITIATED', 'PENDING_OTP', 'PROCESSING', 'COMPLETED')` — loại trừ `FAILED` để cho phép thử lại); (3) Đóng dấu có điều kiện `transition(originalTx.id, COMPLETED, REVERSED)` ở Pha B.
-  3. **Đồng bộ Enum chữ HOA qua Migration (`1710000003000`):** Đổi toàn bộ giá trị `TransactionType` và `TransactionStatus` sang chữ HOA bằng kỹ thuật tạo kiểu enum mới + `ALTER COLUMN ... TYPE ... USING (CASE ...)`.
-* **Reason**: Giữ nguyên tính bất biến của bảng `ledger_entries` và thỏa mãn các bất biến Q4 (tổng ròng gốc + hoàn tiền = 0), Q5 (nhất quán 1-1 giữa `REVERSED` và `REVERSAL COMPLETED`).
-* **Trade-offs**: Việc đổi enum sang chữ HOA đòi hỏi cập nhật đồng bộ từ Migration, Entity, Service, Seed, Frontend đến E2E Tests.
+---
 
-## ADR-013: Why `idempotency_keys` with SHA-256 Request Hash, Response Snapshot, 24h Per-User TTL, `ON CONFLICT DO NOTHING`, and Frontend Auto-Retry
-* **Context**:
-  1. Cần nhận diện chính xác khi client gửi lại cùng một `Idempotency-Key` nhưng thay đổi nội dung yêu cầu (số tiền, tài khoản đích, hoặc gửi sang loại giao dịch khác).
-  2. Cần đảm bảo kết quả trả về khi phát lại (Replay) đúng bằng biên nhận tại thời điểm yêu cầu đó hoàn tất, không bị biến dạng nếu về sau giao dịch bị hoàn tiền (`REVERSAL`).
-  3. Cần giới hạn thời gian lưu trữ khóa (TTL) và trang bị cơ chế tự động thử lại (Auto-Retry) an toàn ở phía Frontend khi mất mạng hoặc timeout.
-* **Decision**:
-  1. **Bảng `idempotency_keys` phạm vi theo người dùng (`UNIQUE (user_id, idempotency_key)`):** Lưu `request_hash` (`char(64)` SHA-256 của dữ liệu yêu cầu đã chuẩn hóa số tiền thành 2 chữ số thập phân bằng xử lý chuỗi, mô tả đã sanitize và thứ tự trường cố định có kèm `operation`), `status` (`IN_PROGRESS`, `COMPLETED`, `FAILED`), `response_status`, `response_body` (`jsonb`), `transaction_id`, và `expired_at` (`created_at + 24 giờ`).
-  2. **Chiếm khóa nguyên tử bằng `INSERT ... ON CONFLICT (user_id, idempotency_key) DO NOTHING RETURNING *`:** Thực hiện ngay trong Pha A sau khi đã xóa khóa cũ hết hạn (`expired_at <= NOW() AND status <> 'IN_PROGRESS'`). Nếu chèn được (`RETURNING` có dòng), tạo phiếu giao dịch và gắn `transaction_id` trong cùng transaction Pha A. Nếu không chèn được, đọc dòng khóa hiện có ngay mà không làm hỏng (abort) transaction PostgreSQL: so khớp `request_hash` (nếu lệch ném `409 Conflict`), nếu khớp thì phát lại từ bản chụp `response_body` (`200 OK` cho `COMPLETED`, lỗi cũ cho `FAILED`, hoặc `202 Accepted` cho `IN_PROGRESS`).
-  3. **Đồng bộ với Job quét treo & Dọn dẹp định kỳ:** `sweepStuckTransactions()` đóng luôn dòng khóa `IN_PROGRESS` của giao dịch treo sang `FAILED (503)` trong cùng một transaction; Cron job `@Cron(CronExpression.EVERY_HOUR)` gọi `deleteExpiredKeys()` xóa các dòng `expired_at < NOW() AND status <> 'IN_PROGRESS'`.
-  4. **Frontend Auto-Retry & In-Flight Guard (`submitIdempotentTransaction` + `useRef`):** Đặt `timeout = 10s`, chỉ tự động thử lại tối đa `3 lần` (`1s → 2s → 4s`) với **cùng `Idempotency-Key`** khi không nhận được phản hồi (mất mạng/timeout) hoặc nhận `202 Accepted`; dừng ngay khi nhận phản hồi cuối cùng (`201`/`200` hoặc `4xx`/`5xx`). Nếu hết 3 lần thử vẫn chưa rõ kết quả, hiển thị trạng thái `"chưa xác định"` (`indeterminate`) và giữ nguyên key. Dùng `useRef(false)` (`inFlightRef`) chặn bấm đúp trong cùng một tích tắc trước khi React kịp re-render nút `disabled`.
-* **Reason**:
-  * Chuẩn hóa số tiền bằng chuỗi (`"50000"` → `"50000.00"`) trước khi băm SHA-256 tránh sai số dấu phẩy động và tránh báo `409` giả.
-  * Lưu bản chụp `response_body` trong cùng transaction Pha B với việc chuyển tiền đảm bảo tính bất biến của biên nhận phát lại (được kiểm chứng bởi bài test `I9`).
-  * Phạm vi `user_id` ngăn chặn rò rỉ dữ liệu giao dịch giữa các người dùng khác nhau khi tình cờ trùng UUID (bài test `I8`).
-* **Trade-offs**:
-  * Khi chạy migration nâng cấp xóa cột `transactions.idempotency_key`, các khóa cũ trước thời điểm nâng cấp không được backfill (vì không có `request_hash` và `response_body` gốc, đồng thời khóa vốn chỉ có hạn dùng 24 giờ).
+## ADR-006: Quản lý Trạng thái Phía Client bằng Zustand và App Router Client Components
+- **Context:** Frontend cần quản lý trạng thái đăng nhập (JWT token, thông tin user) gọn nhẹ, dễ hiểu và đồng bộ nhanh với các trang giao dịch.
+- **Decision:** Sử dụng Next.js App Router kết hợp Client Components (`'use client'`), Zustand (`authStore`) lưu trữ phiên vào `localStorage`, và Axios instance dùng chung có gắn Request Interceptor.
+- **Reason:** Giữ cấu trúc Frontend tối giản (K.I.S.S), không cần cấu hình phức tạp giữa Server Actions và Client State.
+- **Trade-offs:** Không tận dụng SSR cho các trang trong vùng đăng nhập (`(protected)`), nhưng hoàn toàn phù hợp với ứng dụng Web Banking Dashboard.
 
-## ADR-014: Why Database-Backed Two-Role RBAC (`CUSTOMER` / `ADMIN`), Controller-Level `@Roles()` Guard, Dedicated `/admin/*` Endpoints, and Account Ownership Check
-* **Context**:
-  1. Hệ thống cần phân tách rõ ràng giữa quyền hạn của khách hàng cá nhân (`CUSTOMER`) và quản trị viên hệ thống (`ADMIN`), đồng thời đáp ứng yêu cầu kiểm thử của Bài 4.1 (*"CUSTOMER gọi API xem tài khoản người khác → bị từ chối 403"*).
-  2. Nếu lưu cứng vai trò (`role`) hoặc trạng thái (`status`) bên trong JWT payload và chỉ giải mã tĩnh ở mỗi request, khi một người dùng bị khóa hoặc bị thu hồi quyền `ADMIN`, token cũ của họ vẫn tiếp tục sử dụng được cho tới khi hết hạn (1 giờ).
-* **Decision**:
-  1. **Chuẩn hóa Enum hai vai trò `UserRole` (`CUSTOMER`, `ADMIN`) và đọc trực tiếp từ Database mỗi request:** JWT payload chỉ chứa định danh tối thiểu `{ sub: user.id }`. Tại mỗi request, `JwtStrategy.validate()` truy vấn bảng `users` trong PostgreSQL để nạp `user.role` và `user.status` mới nhất vào `req.user`, sau đó `RolesGuard` đối chiếu với metadata `@Roles(...)` (đọc qua `Reflector.getAllAndOverride` ở cả cấp Method và cấp Controller).
-  2. **Tách nhóm `/api/admin/*` bảo vệ ở cấp Controller và kiểm tra sở hữu tại `GET /api/accounts/:accountNumber`:**
-     * Gắn `@UseGuards(JwtAuthGuard, RolesGuard)` và `@Roles(UserRole.ADMIN)` ngay trên class `AdminController` (`/api/admin/users`, `/api/admin/users/:id/status`, `/api/admin/transactions`, `/api/admin/audit-logs`) để mọi route quản trị tự động thừa hưởng chính sách chỉ dành cho `ADMIN`.
-     * Tại `GET /api/accounts/:accountNumber`: nếu người gọi là `CUSTOMER` mà `account.user_id !== requester.id` thì trả về `403 Forbidden`; nếu người gọi là `ADMIN` thì xem được mọi tài khoản (trả `404` nếu không tồn tại).
-     * Các endpoint giao dịch cá nhân (`/api/accounts/me`, `/api/transactions/transfer|deposit|withdraw`, `GET /api/transactions`) mở cho mọi người dùng đã xác thực (`active`) và chỉ thao tác trên chính tài khoản gắn với `req.user.id`.
-  3. **Phạm vi bản rút gọn (`DEFERRED / HOÃN`):** Giữ đúng 2 vai trò `CUSTOMER` và `ADMIN`; hoãn vai trò `TELLER`, nghiệp vụ giao dịch hộ khách tại quầy (`/staff/transactions/*`), hạn mức duyệt của giao dịch viên và giao diện Admin UI (sử dụng Swagger / `curl` để thao tác quản trị).
-* **Reason**:
-  * Đọc `role` và `status` từ Database ở mỗi request giúp thao tác khóa tài khoản (`PATCH /api/admin/users/:id/status`) hoặc thay đổi vai trò có **hiệu lực tức thì (0 giây độ trễ)** đối với cả những JWT token đã cấp trước đó (được chứng minh bằng bài test `RB3` và `AD2`).
-  * Đặt `@Roles(UserRole.ADMIN)` ở mức class `AdminController` loại bỏ hoàn toàn rủi ro lập trình viên thêm route mới vào controller quản trị nhưng quên gắn decorator phân quyền.
-* **Trade-offs**:
-  * Mỗi request có xác thực thực hiện 1 câu truy vấn `SELECT` theo khóa chính `users.id` (chi phí < 1ms nhờ Primary Key Index của PostgreSQL), đổi lại tính an toàn bảo mật tức thời mà không cần hệ thống danh sách đen (token blacklist) trên Redis.
-  * Việc trả `403 Forbidden` trên `GET /api/accounts/:accountNumber` đối với mọi số tài khoản không thuộc về `CUSTOMER` giúp đáp ứng đúng kịch bản kiểm thử của đề bài và ngăn `CUSTOMER` phân biệt `403`/`404` trên endpoint này (dù sự tồn tại của số tài khoản đích vốn vẫn có thể nhận biết khi thực hiện chuyển khoản).
+---
 
-## ADR-015: Why Dual-Mechanism Automated Audit Trail (TypeORM Subscriber + NestJS Interceptor + `AsyncLocalStorage`), `WeakMap` Before-Image Capture, In-Transaction Persistence, Whitelisted Fields, and Append-Only `audit_logs`
-* **Context**:
-  1. Ngân hàng bắt buộc phải lưu vết kiểm toán ("ai đã làm gì, khi nào, từ IP/User-Agent nào, dữ liệu trước `before_data` và sau `after_data` ra sao") cho các thao tác nhạy cảm (Bài 3.3).
-  2. Nếu gọi hàm ghi log thủ công ở từng hàm Service thì dễ bỏ sót; nếu ghi nhật ký thay đổi dữ liệu ở ngoài Database Transaction thì khi giao dịch bị rollback sẽ sinh ra nhật ký giả; và nếu chụp toàn bộ thực thể `User` thì sẽ làm lộ `password_hash` trong bảng `audit_logs`.
-* **Decision**:
-  1. **Bảng `audit_logs` chỉ-ghi-thêm với khóa chính `BIGSERIAL` (Phụ lục P.1):** Sử dụng `@PrimaryGeneratedColumn({ type: 'bigint' })` đồng bộ với `generationStrategy: 'increment'` trong Migration `1710000005000`, kèm 3 index (`(created_at)`, `(actor_id, id)`, `(entity, entity_id)`) và Trigger `trg_audit_logs_immutable` chặn mọi thao tác `UPDATE` và `DELETE`.
-  2. **Truyền ngữ cảnh yêu cầu bằng `AsyncLocalStorage` (`RequestContextMiddleware`):** Mở ngữ cảnh ngay tại Middleware (lưu tham chiếu tới `req`) và thực hiện **đọc trễ (lazy read)** tại thời điểm ghi audit (sau khi `JwtAuthGuard` đã gán `req.user`), đồng thời cắt `user_agent` tối đa 255 ký tự và `ip_address` tối đa 64 ký tự.
-  3. **Kết hợp hai cơ chế tự động (Subscriber + Interceptor):**
-     * **`UserAuditSubscriber` (TypeORM `EntitySubscriberInterface<User>`) cho thay đổi dữ liệu `User`:** Chụp bản sao của đúng 4 trường trong danh sách trắng `ALLOWED_USER_AUDIT_FIELDS = ['fullName', 'email', 'role', 'status']` vào `WeakMap` ngay tại `afterLoad` (giải quyết triệt để Phụ lục P.2 khi Service sửa trực tiếp trên cùng instance `user` trước khi gọi `manager.save(User, user)`). Trong `afterUpdate`, so sánh ảnh trước và ảnh sau, nếu có thay đổi thì chèn bản ghi `USER_STATUS_CHANGED` / `USER_UPDATED` bằng chính **`event.manager`** (nằm trong **cùng một Database Transaction** với thao tác sửa `User`).
-     * **`AuditInterceptor` + Decorator `@Audit(...)` cho các sự kiện nghiệp vụ HTTP:** Gắn lên `POST /api/auth/login` (`AUTH_LOGIN_SUCCESS` / `AUTH_LOGIN_FAILED`) và `POST /api/transactions/:id/reverse` (`TRANSACTION_REVERSED`). Ghi nhận cả khi thành công lẫn khi lỗi (`catchError` ghi bản ghi kèm `outcome: 'ERROR'` rồi **ném lại nguyên vẹn lỗi đó** cho client).
-* **Reason**:
-  * Ghi qua `event.manager` trong `UserAuditSubscriber` đảm bảo tính nguyên tử tuyệt đối: nếu transaction cập nhật `User` bị lỗi và rollback, dòng nhật ký kiểm toán cũng tự động rollback theo (được chứng minh bằng bài test `AU6`).
-  * Danh sách trắng `ALLOWED_USER_AUDIT_FIELDS` ở một nơi duy nhất đảm bảo `password_hash` không bao giờ xuất hiện trong `before_data` hay `after_data` (thỏa mãn bất biến **Q6** và **Q7**).
-* **Trade-offs**:
-  * Các bản ghi do `AuditInterceptor` tạo ra (như `AUTH_LOGIN_FAILED` khi đăng nhập sai mật khẩu) chạy theo cơ chế *best-effort* ngay sau khi handler xử lý chứ không nằm chung trong một transaction nghiệp vụ.
-  * TypeORM Subscriber chỉ kích hoạt khi cập nhật qua `.save()`; các câu lệnh `UPDATE` bằng biểu thức SQL thông qua `QueryBuilder` (như cập nhật số dư `accounts.balance` hoặc `transactions.status`) không đi qua Subscriber vì đã được ghi vết chuyên biệt bởi Sổ cái kép (`ledger_entries`) và State Machine (`transactions`).
+## ADR-007: Quản lý Schema bằng TypeORM Migrations thay cho `synchronize: true`
+- **Context:** Tùy chọn `synchronize: true` của TypeORM tự động sửa bảng khi khởi động app, dễ gây mất dữ liệu hoặc không thể kiểm soát thứ tự nâng cấp schema (như backfill sổ cái, đổi kiểu enum, tạo trigger).
+- **Decision:** Tắt hoàn toàn `synchronize: false` ở mọi môi trường và quản lý mọi thay đổi schema qua các file Migration trong `backend/src/database/migrations/` (chạy tự động qua `start.sh` trước khi seed và khởi động server).
+- **Reason:** Đảm bảo mọi thay đổi cấu trúc bảng, ràng buộc `CHECK`, `Partial Index`, `Trigger` và bước chuyển đổi dữ liệu (data migration) đều có lịch sử phiên bản rõ ràng và có thể hoàn tác (`down`).
+- **Trade-offs:** Khi thay đổi Entity cần viết hoặc sinh thêm file Migration tương ứng.
+
+---
+
+## ADR-008: Mô hình Nạp/Rút Một phía và Cột `actor_account_id` trên Giao dịch
+- **Context:** Hệ thống cần hỗ trợ cả 3 loại giao dịch cơ bản (`TRANSFER`, `DEPOSIT`, `WITHDRAW`) và giao dịch hoàn tiền (`REVERSAL`). Với `DEPOSIT` thì không có tài khoản nguồn (`from_account_id = NULL`), còn với `WITHDRAW` thì không có tài khoản đích (`to_account_id = NULL`).
+- **Decision:** Chọn **mô hình giao dịch một phía** cho Nạp/Rút (kèm `CHECK` constraint `CHK_transactions_type_accounts` kiểm tra chặt các cột `from_account_id`, `to_account_id`, `original_transaction_id` theo từng `type`), và lưu cột `actor_account_id` (`NOT NULL`) để luôn ghi nhận tài khoản của người khởi tạo giao dịch.
+- **Reason:** Đơn giản, trực quan, không cần tạo một "tài khoản tiền mặt hệ thống" được phép âm số dư, đồng thời `actor_account_id` giúp truy vết rõ tài khoản nào đã phát sinh yêu cầu giao dịch.
+- **Trade-offs:** Giao dịch `DEPOSIT` và `WITHDRAW` chỉ sinh 1 bút toán trong `ledger_entries` (thay vì 2 bút toán như `TRANSFER`), nhưng tổng bút toán của từng tài khoản vẫn khớp tuyệt đối với `accounts.balance`.
+
+---
+
+## ADR-009: Pessimistic Locking (`SELECT ... FOR UPDATE`), Khóa theo Thứ tự `id ASC` và Retry Deadlock
+- **Context:** Khi nhiều request rút tiền hoặc chuyển khoản chạy đồng thời trên cùng một tài khoản, hoặc khi A chuyển cho B cùng lúc B chuyển cho A, hệ thống có nguy cơ bị Race Condition (Lost Update) hoặc Deadlock.
+- **Decision:**
+  1. Sử dụng **Pessimistic Locking** (`SELECT ... FOR UPDATE OF "account"`) kết hợp `SET LOCAL lock_timeout = '5s'`.
+  2. Luôn tải và khóa các tài khoản liên quan trong một truy vấn theo thứ tự cố định **`ORDER BY account.id ASC`**.
+  3. Bọc Pha B trong vòng lặp `executeWithDeadlockRetry` (tối đa 3 lần khi gặp mã lỗi PostgreSQL `40P01`, chờ ngẫu nhiên 10–50ms) và giữ điều kiện `WHERE (balance - hold_amount) >= :amount` trong câu lệnh `UPDATE` như lớp bảo vệ thứ hai.
+- **Reason:** Thực nghiệm ở Module 1 (Báo cáo 1.3) cho thấy dưới tải tranh chấp cao (100 request đồng thời vào 1 tài khoản), Pessimistic Locking đạt 100% thành công trong ~242ms với 0 lỗi 503, trong khi Optimistic Locking (`version`) bị lỗi 503 tới 72% do bão retry. Khóa theo thứ tự `id ASC` triệt tiêu vòng chờ đợi tuần hoàn khi chuyển khoản hai chiều A↔B (0 deadlock qua 5 vòng × 50 cặp).
+- **Trade-offs:** Các giao dịch chạm vào cùng một tài khoản phải xếp hàng tuần tự dưới khóa dòng; nếu chờ quá `5s` sẽ nhận `503 Service Unavailable`.
+
+---
+
+## ADR-010: Sổ cái kép Chỉ-Ghi-Thêm (`ledger_entries`), Trigger Bất biến và `id` Kiểu `bigint`
+- **Context:** Nếu chỉ cập nhật đè cột `accounts.balance`, hệ thống không thể chứng minh lịch sử biến động số dư hoặc phát hiện sai lệch khi thanh tra.
+- **Decision:**
+  1. Tạo bảng **`ledger_entries`** lưu mọi bút toán `DEBIT` / `CREDIT` kèm `balance_after` lấy trực tiếp từ `UPDATE accounts ... RETURNING balance` trong cùng một Database Transaction.
+  2. Sử dụng khóa chính `id` kiểu `bigint` tự tăng (`BIGSERIAL`, đồng bộ với `@PrimaryGeneratedColumn({ type: 'bigint' })`) để cố định thứ tự ghi sổ.
+  3. Bảo vệ tính bất biến (append-only) bằng 2 lớp: không có hàm sửa/xóa ở tầng ứng dụng và gắn Trigger `trg_ledger_entries_immutable` chặn `UPDATE` / `DELETE` ngay tại PostgreSQL.
+  4. Giữ `accounts.balance` làm bản sao đọc nhanh (cached balance), còn `ledger_entries` là nguồn sự thật (source of truth).
+- **Reason:** Đảm bảo mọi biến động tiền tệ đều có dấu vết bất biến và sao kê (`balance_after`) luôn khớp với số dư cộng dồn theo thứ tự `id`.
+- **Trade-offs:** Tốn thêm dung lượng lưu trữ bút toán và thao tác `INSERT` trong mỗi giao dịch; ở môi trường production thực tế cần kết hợp thêm `REVOKE UPDATE, DELETE, TRUNCATE` đối với DB user của ứng dụng.
+
+---
+
+## ADR-011: Máy Trạng thái Giao dịch (State Machine), Ghi nhận `FAILED` và Job Quét Giao dịch Treo
+- **Context:** Giao dịch tài chính cần có vòng đời rõ ràng; các giao dịch thất bại do lỗi nghiệp vụ (như thiếu số dư, vượt hạn mức, tài khoản bị đóng băng) cần được lưu vết thay vì biến mất sau khi rollback, và các giao dịch bị kẹt ở `PROCESSING` (do sập nguồn/mất kết nối giữa chừng) cần được tự động phát hiện.
+- **Decision:**
+  1. Định nghĩa bảng chuyển trạng thái hợp lệ duy nhất `ALLOWED_STATUS_TRANSITIONS` (`INITIATED -> PENDING_OTP | PROCESSING`, `PENDING_OTP -> PROCESSING | FAILED`, `PROCESSING -> COMPLETED | FAILED`, `COMPLETED -> REVERSED`) và hàm `transition()` thực hiện `UPDATE ... WHERE id = :id AND status = :from`.
+  2. Ghi nhận mọi lỗi ở Pha B thành trạng thái `FAILED` kèm mã lý do `failure_code` ở Pha C (sau khi Pha B đã rollback tiền và sổ cái).
+  3. Thiết lập cron job `sweepStuckTransactions()` (`@nestjs/schedule`, chạy mỗi phút) tìm các giao dịch `PROCESSING` có `updated_at` cũ hơn `120s` và chưa có bút toán sổ cái để chuyển sang `FAILED` (`failure_code = TIMEOUT`) đồng thời đóng luôn dòng khóa `idempotency_keys` tương ứng sang `FAILED` (`503`).
+- **Reason:** Đảm bảo không bao giờ có giao dịch rơi vào trạng thái "lửng lơ" vô thời hạn, không thể chuyển trạng thái sai cạnh (như `FAILED -> COMPLETED`), và lưu đầy đủ lịch sử các lần giao dịch thất bại.
+- **Trade-offs:** Job `@Cron` chạy trong tiến trình backend phù hợp với kiến trúc 1 instance hiện tại; nếu mở rộng nhiều instance cần thêm cơ chế distributed lock hoặc `FOR UPDATE SKIP LOCKED`.
+
+---
+
+## ADR-012: Hoàn tiền bằng Giao dịch `REVERSAL` Đảo Bút toán và 3 Lớp Chống Hoàn tiền Hai lần
+- **Context:** Khi cần hoàn tiền một giao dịch đã `COMPLETED`, hệ thống tài chính không được phép xóa hay sửa số tiền của giao dịch gốc hay bút toán gốc.
+- **Decision:**
+  1. Tạo endpoint `POST /api/transactions/:id/reverse` (chỉ dành cho `ADMIN` qua `RolesGuard`) sinh ra một giao dịch mới có `type = REVERSAL` và `original_transaction_id` trỏ về giao dịch gốc.
+  2. Đảo ngược từng bút toán của giao dịch gốc (`CREDIT -> DEBIT`, `DEBIT -> CREDIT`) và kiểm tra số dư khả dụng của bên bị thu hồi tiền (`REVERSAL_INSUFFICIENT_BALANCE` nếu đã tiêu hết).
+  3. Bảo vệ chống hoàn tiền hai lần bằng **3 lớp**: (a) Kiểm tra `originalTx.status === 'COMPLETED'` ở Pha A; (b) Partial Unique Index `IDX_transactions_active_reversal_original` trên `(original_transaction_id)` với điều kiện `type = 'REVERSAL' AND status IN ('INITIATED', 'PENDING_OTP', 'PROCESSING', 'COMPLETED')` (loại trừ `FAILED` để cho phép thử lại khi bên nhận nạp thêm tiền); (c) Đóng dấu có điều kiện `transition(originalTx.id, COMPLETED -> REVERSED)` trong cùng transaction Pha B.
+- **Reason:** Giữ nguyên vẹn lịch sử giao dịch gốc và sổ cái chỉ-ghi-thêm, đồng thời ngăn chặn tuyệt đối việc hoàn tiền trùng lặp ngay cả khi nhiều Admin bấm cùng lúc.
+- **Trade-offs:** Nếu người nhận đã rút tiêu hết tiền, yêu cầu hoàn tiền sẽ thất bại (`422`) và cần chờ tài khoản đó có đủ số dư mới hoàn tiền lại được.
+
+---
+
+## ADR-013: Kiến trúc Bảng `idempotency_keys` (Request Hash, Response Snapshot, TTL 24h) và Frontend Auto-Retry
+- **Context:** Cần nâng cấp cơ chế Idempotency từ mức cột đơn giản lên chuẩn hệ thống thanh toán (Bài 2.1 & 2.2): phát hiện trùng khóa nhưng đổi nội dung, trả lại đúng bản chụp phản hồi ban đầu, có hạn dùng và hỗ trợ Frontend tự động thử lại khi mạng lỗi.
+- **Decision:**
+  1. **Cấu trúc bảng `idempotency_keys`:** Gồm `user_id`, `idempotency_key`, `request_hash` (`char(64)`), `status` (`IN_PROGRESS | COMPLETED | FAILED`), `response_status`, `response_body` (`jsonb`), `transaction_id`, `created_at`, `expired_at` (`created_at + 24 giờ`), với ràng buộc `UNIQUE (user_id, idempotency_key)` và `CHECK (status = 'IN_PROGRESS' OR response_status IS NOT NULL)`.
+  2. **Chuẩn hóa và băm yêu cầu (`request_hash`):** Chuẩn hóa `amount` về đúng 2 chữ số thập phân bằng xử lý chuỗi (`"50000"` → `"50000.00"`), sanitize `description`/`reason`, xếp các trường theo thứ tự cố định kèm tên `operation` (`TRANSFER | DEPOSIT | WITHDRAW | REVERSE`) rồi băm SHA-256.
+  3. **Đăng ký khóa nguyên tử bằng `INSERT ... ON CONFLICT DO NOTHING`:** Tại Pha A, xóa dòng khóa cũ đã hết hạn (nếu `expired_at <= NOW()` và `status <> 'IN_PROGRESS'`), sau đó chạy `INSERT ... ON CONFLICT ("user_id", "idempotency_key") DO NOTHING RETURNING *`. Nếu không chèn được (khóa đã tồn tại), đọc ngay dòng khóa hiện có trong cùng kết nối mà không làm hỏng transaction để so khớp `request_hash` (khác → `409 Conflict`; khớp → trả bản chụp `200`, lỗi đã lưu `422/500/503`, hoặc `202 Accepted` nếu đang `IN_PROGRESS`).
+  4. **Đồng bộ trạng thái khóa trong cùng Transaction:** Chuyển khóa sang `COMPLETED` ngay trong transaction Pha B (cùng lúc với việc chuyển tiền) và sang `FAILED` trong transaction Pha C (hoặc trong `sweepStuckTransactions()`). Dọn khóa hết hạn mỗi giờ bằng `@Cron(CronExpression.EVERY_HOUR)`.
+  5. **Frontend Auto-Retry & In-Flight Guard (`submitIdempotentTransaction`):** Đặt timeout `10s`, tự động retry tối đa `3` lần (chờ `1s -> 2s -> 4s`) với **cùng `Idempotency-Key`** chỉ khi không nhận được phản hồi (mất mạng/timeout) hoặc nhận `202 Accepted`; dừng ngay khi nhận bất kỳ phản hồi cuối cùng nào (`201/200` hoặc `4xx/5xx`); kết hợp cờ đồng bộ `useRef(false)` để chặn bấm đúp trong cùng một tích tắc trước khi React kịp re-render.
+- **Reason:** Đảm bảo tính nhất quán tuyệt đối giữa trạng thái khóa và biến động tiền tệ; trả về đúng bản chụp kết quả lúc yêu cầu hoàn tất; và bảo vệ người dùng khỏi bị trừ tiền hai lần khi mạng chập chờn hoặc bấm nhầm nhiều lần.
+- **Trade-offs:** Phản hồi Replay trả về **bản chụp tại thời điểm giao dịch đó kết thúc** (ví dụ: giao dịch lúc đầu trả `COMPLETED`, về sau bị Admin hoàn tiền sang `REVERSED`, thì replay lại khóa cũ của lần chuyển vẫn trả bản chụp `COMPLETED` ban đầu; trạng thái mới nhất xem ở API Lịch sử giao dịch). Ngoài ra, khi nâng cấp xóa cột `transactions.idempotency_key`, các khóa cũ trước thời điểm nâng cấp không được backfill (chấp nhận được vì khóa vốn chỉ có TTL 24 giờ).
+
+---
+
+## ADR-014: Phân quyền theo Vai trò (RBAC) Đọc Trực tiếp từ Database và Phạm vi Rút gọn 2 Vai trò (`CUSTOMER` / `ADMIN`)
+- **Context:** Hệ thống ngân hàng cần phân tách rõ quyền hạn giữa Khách hàng thông thường (`CUSTOMER`) và Quản trị viên hệ thống (`ADMIN`), đồng thời đảm bảo khi thay đổi vai trò hoặc khóa tài khoản, quyền hạn mới phải có hiệu lực ngay lập tức mà không chờ JWT hết hạn (Bài 4.1).
+- **Decision:**
+  1. Chuẩn hóa enum `users.role` sang chữ HOA gồm 2 giá trị: **`CUSTOMER`** và **`ADMIN`** (giữ nguyên `users.status` là `'active' | 'locked'` theo đề gốc).
+  2. Xây dựng decorator `@Roles(...roles)` và `RolesGuard` sử dụng `Reflector` để đọc danh sách vai trò yêu cầu ở cấp Controller hoặc Method, đối chiếu trực tiếp với `req.user.role` (được `JwtStrategy.validate()` tải tươi từ PostgreSQL ở mỗi request).
+  3. Đặt `@Roles(UserRole.ADMIN)` ở cấp class cho toàn bộ `AdminController` (`/api/admin/*`) và ở cấp method cho `POST /api/transactions/:id/reverse`. Bổ sung kiểm tra quyền sở hữu (Ownership Check) tại `GET /api/accounts/:accountNumber`: `CUSTOMER` chỉ xem được tài khoản của chính mình (xem của người khác trả `403 Forbidden`), trong khi `ADMIN` xem được mọi tài khoản (`404` nếu không tồn tại).
+  4. Các endpoint giao dịch cá nhân (`/api/accounts/me`, `/api/transactions/transfer|deposit|withdraw`, `GET /api/transactions`) mở cho mọi người dùng đã xác thực nhưng luôn lấy danh tính từ `req.user.id` của JWT, nên mỗi người chỉ thao tác được trên tài khoản của chính mình.
+  5. **Phạm vi rút gọn (`HOÃN`):** Tạm hoãn vai trò `TELLER`, các API giao dịch hộ khách tại quầy (`/staff/transactions/*`), hạn mức duyệt giao dịch viên và giao diện Admin UI ở Frontend (sử dụng Swagger / `curl` với token `ADMIN`).
+- **Reason:** Đọc `role` và `status` từ DB ở mỗi request giúp loại bỏ hoàn toàn độ trễ thu hồi quyền của JWT tĩnh; đặt `@Roles(UserRole.ADMIN)` ở cấp Controller ngăn ngừa rủi ro quên gắn guard khi thêm route quản trị mới; trả `403` tại `GET /api/accounts/:accountNumber` đáp ứng chính xác kịch bản kiểm thử phân quyền của đề bài.
+- **Trade-offs:** Trả `403` khi `CUSTOMER` tra cứu số tài khoản khác có thể gián tiếp cho biết định dạng endpoint tồn tại, nhưng số tài khoản đích vốn đã có thể kiểm tra qua luồng chuyển khoản nên hoàn toàn chấp nhận được. Việc hoãn vai trò `TELLER` và Admin UI giúp giữ dự án gọn gàng, tập trung vào độ tin cậy của tầng Backend.
+
+---
+
+## ADR-015: Nhật ký Kiểm toán Tự động Chỉ-Ghi-Thêm (`audit_logs`) Kết hợp TypeORM Subscriber, Interceptor và `AsyncLocalStorage`
+- **Context:** Mọi thao tác nhạy cảm (khóa/mở khóa người dùng, cập nhật hồ sơ, xóa mềm người dùng, cập nhật trạng thái/hạn mức/hold của tài khoản, đăng nhập thành công/thất bại, hoàn tiền giao dịch) phải được ghi lại tự động vào bảng `audit_logs` kèm thông tin người thực hiện (`actor_id`), IP, User-Agent và ảnh dữ liệu trước/sau (`before_data` / `after_data`) mà không làm rò rỉ mật khẩu hay có thể bị tẩy xóa (Bài 3.3).
+- **Decision:**
+  1. **Bảng `audit_logs` chỉ-ghi-thêm:** Sử dụng khóa chính `id` kiểu `bigint` tự tăng (`BIGSERIAL`, đồng bộ giữa `@PrimaryGeneratedColumn({ type: 'bigint' })` và Migration theo Phụ lục P.1) để cố định thứ tự thời gian tuyệt đối, kèm Trigger `trg_audit_logs_immutable` chặn mọi câu lệnh `UPDATE` và `DELETE` ngay tại tầng PostgreSQL.
+  2. **Truyền ngữ cảnh yêu cầu bằng `AsyncLocalStorage` (`RequestContextMiddleware`):** Mở ngữ cảnh ở tầng Middleware lưu tham chiếu tới `req`, và thực hiện **đọc trễ (lazy read)** `req.user?.id`, `req.ip`, `req.headers['user-agent']` tại thời điểm ghi log (vì `JwtAuthGuard` chạy sau Middleware).
+  3. **Kết hợp hai cơ chế ghi Audit tự động:**
+     - **TypeORM Entity Subscribers (`UserAuditSubscriber` & `AccountAuditSubscriber`):** Lắng nghe thực thể `User` và `Account`, chụp bản sao an toàn vào `WeakMap` ngay tại `afterLoad(entity)` (giải quyết triệt để vấn đề `event.databaseEntity` bị ghi đè khi sửa cùng instance rồi gọi `save()`, theo Phụ lục P.2 & P.3), đối chiếu với `afterUpdate` / `afterSoftRemove` theo danh sách trắng `ALLOWED_USER_AUDIT_FIELDS = ['fullName', 'email', 'phone', 'role', 'status']` và `ALLOWED_ACCOUNT_AUDIT_FIELDS = ['status', 'tier', 'holdAmount']` (tuyệt đối không có `password_hash`), và chèn bản ghi `USER_STATUS_CHANGED` / `USER_UPDATED` / `USER_SOFT_DELETED` / `ACCOUNT_UPDATED` bằng **`event.manager`** (nằm trong **cùng một Database Transaction** với thao tác sửa dữ liệu).
+     - **NestJS Interceptor (`AuditInterceptor` + `@Audit()`):** Gắn lên các sự kiện nghiệp vụ cấp HTTP (`POST /api/auth/login` → `AUTH_LOGIN_SUCCESS` / `AUTH_LOGIN_FAILED`; `POST /api/transactions/:id/reverse` → `TRANSACTION_REVERSED`), ghi nhận cả khi thành công lẫn thất bại (sau khi ghi xong phải **ném lại đúng lỗi gốc**, không nuốt lỗi).
+- **Reason:** Kết hợp Subscriber và Interceptor giúp tận dụng thế mạnh của cả hai: các thay đổi trạng thái dữ liệu (`User`, `Account`) được bảo vệ nguyên tử cùng transaction (nếu transaction rollback thì bản ghi audit cũng rollback theo), trong khi các sự kiện hành vi như đăng nhập sai mật khẩu (không sửa dòng DB nào) vẫn được Interceptor ghi vết đầy đủ.
+- **Trade-offs:** Cơ chế ghi của `AuditInterceptor` là *best-effort* (chạy ngay sau khi handler xử lý xong, không nằm chung transaction với handler); và các câu lệnh cập nhật bằng biểu thức SQL qua `QueryBuilder` (như cộng/trừ `accounts.balance` hay đổi `transactions.status`) không đi qua Subscriber (đã có `ledger_entries` và State Machine lưu vết chuyên biệt).
+
+---
+
+## ADR-016: Kiểm tra Hạn mức Giao dịch ở Pha B dưới Khóa dòng theo Ngày Việt Nam bằng Đồng hồ Database
+- **Context:** Ngân hàng cần giới hạn số tiền tối đa cho mỗi lần giao dịch và tổng số tiền lũy kế trong một ngày theo từng hạng tài khoản (`STANDARD`: 30.000.000đ/lần, 50.000.000đ/ngày; `VIP`: 100.000.000đ/lần, 200.000.000đ/ngày — Bài 5.1). Nếu kiểm tra hạn mức không có khóa hoặc tính mốc ngày theo đồng hồ máy chủ NodeJS, nhiều request đồng thời có thể lách qua trần hạn mức ngày hoặc lệch múi giờ.
+- **Decision:**
+  1. Đặt cấu hình hạn mức tập trung tại một hằng số duy nhất `ACCOUNT_TIER_LIMITS` theo `AccountTier` (`STANDARD` / `VIP`).
+  2. Thực hiện kiểm tra hạn mức (`enforceOutgoingLimitsInPhaseB`) ở **Bước 3 của Pha B, ngay bên dưới khóa dòng `SELECT ... FOR UPDATE` của tài khoản nguồn**, chỉ áp dụng cho các giao dịch làm tiền đi ra khỏi tài khoản (`TRANSFER` và `WITHDRAW`; miễn áp dụng cho `DEPOSIT` và `REVERSAL`).
+  3. Tính tổng số tiền đã dùng hôm nay (`usedToday`) bằng truy vấn SQL lấy tổng `amount` của các giao dịch `TRANSFER` / `WITHDRAW` đang ở trạng thái **`COMPLETED`** có `created_at` nằm trong ngày hiện tại theo múi giờ Việt Nam (`Asia/Ho_Chi_Minh`) tính trực tiếp bằng đồng hồ của PostgreSQL:
+     `t.created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Ho_Chi_Minh') AT TIME ZONE 'Asia/Ho_Chi_Minh')`
+  4. So sánh số tiền bằng số học nguyên `BigInt` (quy đổi ra xu, không dùng số thực dấu chấm động). Khi vượt hạn mức, ném `LIMIT_PER_TRANSACTION_EXCEEDED` hoặc `LIMIT_PER_DAY_EXCEEDED` (`422`) kèm thông báo động nêu rõ hạn mức và số tiền còn lại hôm nay (`formatVndCurrency`), đồng thời lưu thông báo này vào bản chụp `idempotency_keys.response_body` ở Pha C.
+- **Reason:** Kiểm tra dưới khóa dòng `FOR UPDATE` ở Pha B bắt buộc mọi giao dịch đồng thời của cùng một tài khoản phải xếp hàng kiểm tra tuần tự (giao dịch sau luôn nhìn thấy giao dịch trước đã `COMMIT` trạng thái `COMPLETED`), triệt tiêu 100% lỗi vượt trần hạn mức ngày khi bắn song song. Chỉ tính `status = 'COMPLETED'` đảm bảo giao dịch `FAILED` (chưa trừ tiền) và giao dịch gốc đã `REVERSED` (tiền đã hoàn trả) không chiếm dụng hạn mức của khách hàng.
+- **Trade-offs:** Vì hạn mức được kiểm tra chính thức ở Pha B, khách hàng chỉ nhận kết quả từ chối sau khi gửi yêu cầu; để tối ưu trải nghiệm, API `GET /api/accounts/me` trả thêm khối `limits` (`usedToday`, `remainingToday` đọc không khóa) để giao diện hiển thị thanh tiến độ và gợi ý sớm cho người dùng.
+
+---
+
+## ADR-017: Trạng thái Tài khoản (`ACTIVE / FROZEN / CLOSED`), Số dư Khả dụng (`balance − hold_amount`) trong Câu `UPDATE` và Luật Đóng Tài khoản
+- **Context:** Cần quản lý vòng đời trạng thái của tài khoản ngân hàng (`ACTIVE`, `FROZEN`, `CLOSED`) và số tiền đang bị phong tỏa/giữ chỗ (`hold_amount`), sao cho tài khoản không hoạt động thì không thể giao dịch (cả chiều đi lẫn chiều đến) và khách hàng không bao giờ rút/chuyển lẹm vào phần tiền đang bị phong tỏa (Bài 5.2).
+- **Decision:**
+  1. Bổ sung vào bảng `accounts` các cột `status` (`ACTIVE | FROZEN | CLOSED`, mặc định `ACTIVE`), `tier` (`STANDARD | VIP`, mặc định `STANDARD`), `hold_amount` (`numeric(18,2)`, mặc định `0`) cùng **3 ràng buộc `CHECK` mức Database**: `CHK_accounts_balance_non_negative` (`balance >= 0`), `CHK_accounts_hold_non_negative` (`hold_amount >= 0`), và `CHK_accounts_hold_lte_balance` (`hold_amount <= balance`).
+  2. Kiểm tra trạng thái tài khoản (`ensureAccountActiveInPhaseB`) ở **Pha B dưới khóa dòng** cho cả 4 nghiệp vụ (`transfer`, `deposit`, `withdraw`, `reverse`). Nếu tài khoản nguồn hoặc đích đang `FROZEN` hay `CLOSED`, từ chối với đúng 1 trong 4 mã lỗi (`SOURCE_ACCOUNT_FROZEN`, `SOURCE_ACCOUNT_CLOSED`, `DESTINATION_ACCOUNT_FROZEN`, `DESTINATION_ACCOUNT_CLOSED` — HTTP `422`) và ghi nhận bản ghi `FAILED` ở Pha C.
+  3. Đặt công thức kiểm tra **số dư khả dụng** ở cả 2 lớp: kiểm tra bằng `BigInt` (`balance - hold_amount >= amount`) ở Pha B và khóa chặt điều kiện ngay trong câu lệnh SQL `UPDATE accounts SET balance = balance - :amount WHERE id = :id AND status = 'ACTIVE' AND deleted_at IS NULL AND (balance - hold_amount) >= :amount RETURNING balance`.
+  4. Cung cấp API `PATCH /api/admin/accounts/:accountNumber` (chỉ `ADMIN`), khóa dòng `Account` bằng `FOR UPDATE`, áp dụng luật chuyển trạng thái: `ACTIVE <-> FROZEN` tự do; `CLOSED` là trạng thái kết thúc (không thể mở lại → `409`); chỉ cho phép chuyển sang `CLOSED` khi `balance = 0`, `hold_amount = 0` và không có giao dịch `INITIATED / PENDING_OTP / PROCESSING` nào liên quan (`409` nếu vi phạm); `holdAmount` phải thỏa `0 <= holdAmount <= balance` (`422` nếu vượt số dư).
+- **Reason:** Kiểm tra trạng thái tài khoản ở Pha B (thay vì chặn ở Pha A) đảm bảo mọi giao dịch chạm vào tài khoản `FROZEN`/`CLOSED` đều được lưu vết `FAILED` đúng yêu cầu đề bài. Kết hợp khóa dòng `FOR UPDATE`, điều kiện `WHERE (balance - hold_amount) >= :amount` trong câu `UPDATE` và `CHECK (hold_amount <= balance)` ở PostgreSQL tạo thành 3 lớp bảo vệ không thể xuyên thủng khi Admin đặt hold đồng thời với lúc khách rút tiền.
+- **Trade-offs:** Khi một tài khoản đang bị `FROZEN`, ngay cả giao dịch hoàn tiền (`REVERSAL`) của Admin cũng bị từ chối tạm thời; Admin cần mở băng tài khoản đó sang `ACTIVE` trước khi thực hiện hoàn tiền (nhằm tránh làm thay đổi số dư trên tài khoản đang phong tỏa hoặc đã đóng `CLOSED`).
+
+---
+
+## ADR-018: Xóa mềm bằng `@DeleteDateColumn`, Rà soát `withDeleted` và Lưu vết Phiên bản Hồ sơ Tường minh (`account_history`)
+- **Context:** Trong hệ thống tài chính, việc xóa cứng (`DELETE FROM`) người dùng hoặc tài khoản sẽ phá hủy khóa ngoại của sổ cái `ledger_entries` và làm mất dấu vết lịch sử giao dịch. Đồng thời, khi người dùng cập nhật thông tin cá nhân (`fullName`, `email`, `phone`), hệ thống cần lưu lại các phiên bản cũ để tra cứu (Bài 3.4).
+- **Decision:**
+  1. **Xóa mềm nguyên tử (`DELETE /api/admin/users/:id`):** Sử dụng `@DeleteDateColumn` (`deleted_at`) trên cả `User` và `Account`. Khi Admin xóa một `CUSTOMER` (yêu cầu `balance = 0`, `hold_amount = 0`, không có giao dịch đang dở), hệ thống thực hiện trong **một Database Transaction** dưới khóa dòng `Account`: chuyển `account.status = 'CLOSED'`, gọi `softRemove(Account)` và `softRemove(User)`, đồng thời tự động ghi Audit `ACCOUNT_UPDATED` và `USER_SOFT_DELETED`.
+  2. **Rà soát Bản đồ Truy vấn với `@DeleteDateColumn`:**
+     - Để mặc định tự lọc (`deleted_at IS NULL`) ở `AuthService.login`, `JwtStrategy.validate` (thu hồi phiên `401` ngay lập tức ở request kế tiếp), `AccountsService`, bước tìm tài khoản đích khi chuyển khoản (`404`) và danh sách `/api/admin/users` mặc định.
+     - Chủ động bật **`withDeleted`** tại: (a) `AuthService.register` và `seed.ts` để email và số tài khoản của người dùng đã xóa mềm vẫn được giữ chỗ (`409 Conflict`); (b) `TransactionsService.getTransactions` và `AdminService.getTransactions` khi `LEFT JOIN` `fromAccount` / `toAccount` để lịch sử giao dịch của người còn lại **vẫn hiển thị đầy đủ `counterpartyAccountNumber` của đối tác đã xóa mềm**; (c) `GET /api/admin/users?includeDeleted=true` dành cho Admin.
+  3. **Lưu vết phiên bản hồ sơ tường minh trong `account_history` (`PATCH /api/users/me`):** Tạo bảng `account_history` (`id BIGSERIAL`, `UNIQUE (user_id, version)`, kèm Trigger chỉ-ghi-thêm `trg_account_history_immutable`). Khi người dùng sửa `fullName`, `email` (bắt buộc kèm `currentPassword`, sai trả `400 Bad Request`) hoặc `phone` và có ít nhất 1 trường thực sự thay đổi, trong cùng một transaction dưới khóa `FOR UPDATE`: **chèn bản chụp giá trị cũ vào `account_history` với `version = profile_version` hiện tại trước**, sau đó mới ghi đè giá trị mới và tăng `profile_version + 1` trên bảng `users`.
+- **Reason:** Dùng `@DeleteDateColumn` giúp hầu hết các truy vấn đọc thông thường tự động loại trừ bản ghi đã xóa mềm mà không sợ quên điều kiện `WHERE`, trong khi việc bật `.withDeleted()` có kiểm soát ở JOIN lịch sử giao dịch bảo toàn trọn vẹn thông tin đối tác. Ghi `account_history` tường minh trong `UsersService` (tách biệt với `audit_logs` của Subscriber) giúp đồng bộ chặt chẽ với việc tăng `profile_version` và phục vụ đúng mục đích "xem lại các phiên bản hồ sơ cũ" của khách hàng và Admin.
+- **Trade-offs:** Vì cột `users.email` giữ ràng buộc `UNIQUE` toàn cục để bảo toàn định danh kiểm toán, email của người dùng đã bị xóa mềm không thể dùng để đăng ký tài khoản mới; và phiên bản hiện tại chưa hỗ trợ API khôi phục (`restore`) người dùng đã xóa mềm.

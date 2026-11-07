@@ -67,7 +67,7 @@ export class TransactionsController {
   @ApiOperation({
     summary: 'Thực hiện chuyển khoản nội bộ (hỗ trợ Idempotency Snapshot)',
     description:
-      'Yêu cầu header Idempotency-Key (UUID, hạn dùng 24h). Nếu gửi lại cùng key và cùng nội dung (request_hash), API trả về đúng bản chụp kết quả (response_body snapshot) đã lưu ở lần xử lý đầu tiên.',
+      'Yêu cầu header Idempotency-Key (UUID, hạn dùng 24h). Kiểm tra trạng thái tài khoản (ACTIVE/FROZEN/CLOSED), hạn mức và số dư khả dụng (balance - holdAmount) dưới khóa dòng ở Pha B.',
   })
   @ApiHeader({
     name: 'Idempotency-Key',
@@ -101,7 +101,7 @@ export class TransactionsController {
   @ApiResponse({
     status: 422,
     description:
-      'Không đủ số dư hoặc tài khoản đích bị khóa (ghi nhận FAILED kèm bản chụp lỗi)',
+      'Không đủ số dư khả dụng, vượt hạn mức, tài khoản nguồn/đích bị FROZEN/CLOSED hoặc chủ tài khoản đích bị khóa (ghi nhận FAILED kèm bản chụp lỗi)',
   })
   @ApiResponse({
     status: 503,
@@ -127,7 +127,7 @@ export class TransactionsController {
     summary:
       'Nạp tiền vào tài khoản của bản thân (hỗ trợ Idempotency Snapshot)',
     description:
-      'Yêu cầu header Idempotency-Key (UUID, hạn dùng 24h). Nếu gửi lại cùng key và cùng nội dung (request_hash), API trả về đúng bản chụp kết quả đã lưu.',
+      'Yêu cầu header Idempotency-Key (UUID, hạn dùng 24h). Chỉ cho phép nạp khi tài khoản ở trạng thái ACTIVE.',
   })
   @ApiHeader({
     name: 'Idempotency-Key',
@@ -160,7 +160,8 @@ export class TransactionsController {
   })
   @ApiResponse({
     status: 422,
-    description: 'Số dư sau khi nạp vượt quá giới hạn numeric(18,2)',
+    description:
+      'Tài khoản đang bị FROZEN/CLOSED hoặc số dư sau khi nạp vượt quá giới hạn numeric(18,2)',
   })
   @ApiResponse({
     status: 503,
@@ -185,7 +186,7 @@ export class TransactionsController {
   @ApiOperation({
     summary: 'Rút tiền từ tài khoản của bản thân (hỗ trợ Idempotency Snapshot)',
     description:
-      'Yêu cầu header Idempotency-Key (UUID, hạn dùng 24h). Nếu gửi lại cùng key và cùng nội dung (request_hash), API trả về đúng bản chụp kết quả đã lưu.',
+      'Yêu cầu header Idempotency-Key (UUID, hạn dùng 24h). Kiểm tra trạng thái tài khoản ACTIVE, hạn mức và số dư khả dụng (balance - holdAmount) dưới khóa dòng.',
   })
   @ApiHeader({
     name: 'Idempotency-Key',
@@ -218,7 +219,8 @@ export class TransactionsController {
   })
   @ApiResponse({
     status: 422,
-    description: 'Không đủ số dư khả dụng (ghi nhận FAILED kèm bản chụp lỗi)',
+    description:
+      'Không đủ số dư khả dụng, vượt hạn mức, hoặc tài khoản đang bị FROZEN/CLOSED (ghi nhận FAILED kèm bản chụp lỗi)',
   })
   @ApiResponse({
     status: 503,
@@ -268,7 +270,7 @@ export class TransactionsController {
     summary:
       'Hoàn tiền một giao dịch COMPLETED bằng giao dịch REVERSAL mới (Chỉ ADMIN, hỗ trợ Idempotency Snapshot & Audit Log)',
     description:
-      'Yêu cầu quyền ADMIN và header Idempotency-Key (UUID, hạn dùng 24h). Nếu gửi lại cùng key và cùng nội dung, trả về đúng bản chụp kết quả hoàn tiền đã lưu.',
+      'Yêu cầu quyền ADMIN, header Idempotency-Key (UUID, hạn dùng 24h) và các tài khoản liên quan phải đang ở trạng thái ACTIVE.',
   })
   @ApiParam({
     name: 'id',
@@ -309,7 +311,7 @@ export class TransactionsController {
   @ApiResponse({
     status: 422,
     description:
-      'Tài khoản nhận tiền không đủ số dư để thu hồi hoàn tiền (REVERSAL_INSUFFICIENT_BALANCE)',
+      'Tài khoản liên quan đang bị FROZEN/CLOSED hoặc không đủ số dư khả dụng để thu hồi hoàn tiền (REVERSAL_INSUFFICIENT_BALANCE)',
   })
   async reverseTransaction(
     @Request() req: any,

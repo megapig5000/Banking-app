@@ -3,6 +3,7 @@ import {
   DataSource,
   EntitySubscriberInterface,
   EventSubscriber,
+  SoftRemoveEvent,
   UpdateEvent,
 } from 'typeorm';
 import { User } from '../database/entities/user.entity';
@@ -25,17 +26,20 @@ import {
 export class UserAuditSubscriber implements EntitySubscriberInterface<User> {
   /**
    * WeakMap lưu bản chụp (snapshot) của các trường được phép ngay tại thời điểm thực thể User
-   * được tải từ Database (afterLoad). Giải quyết triệt để lưu ý ở Phụ lục P.2:
-   * ngay cả khi Service gán đè thuộc tính trên cùng instance `user` trước khi gọi `save(user)`,
-   * Subscriber vẫn giữ được nguyên vẹn ảnh trước (`before_data`).
+   * được tải từ Database (afterLoad).
    */
   private readonly loadedSnapshots = new WeakMap<
     User,
     AllowedUserAuditSnapshot
   >();
 
+  /**
+   * WeakSet ngăn ghi đúp bản ghi USER_SOFT_DELETED nếu cả afterUpdate và afterSoftRemove
+   * cùng được TypeORM kích hoạt trong một lệnh manager.softRemove(User, user).
+   */
+  private readonly softDeletedRecorded = new WeakSet<User>();
+
   constructor(private readonly dataSource: DataSource) {
-    // Đăng ký Subscriber vào DataSource của ứng dụng (kiểm tra tránh đăng ký trùng)
     const alreadyRegistered = this.dataSource.subscribers.some(
       (sub) => sub instanceof UserAuditSubscriber,
     );
@@ -61,7 +65,16 @@ export class UserAuditSubscriber implements EntitySubscriberInterface<User> {
       return;
     }
 
-    // Ưu tiên lấy ảnh trước từ WeakMap đã chụp lúc afterLoad; dự phòng bằng event.databaseEntity
+    // Nếu đây là thao tác xóa mềm (cột deleted_at vừa được gán giá trị)
+    if (updatedEntity.deleted_at) {
+      await this.recordSoftDeleteAuditIfNeeded(
+        event.manager,
+        updatedEntity,
+        event.databaseEntity,
+      );
+      return;
+    }
+
     const beforeSnapshot =
       this.loadedSnapshots.get(updatedEntity) ??
       pickAllowedUserAuditSnapshot(event.databaseEntity);
@@ -84,7 +97,6 @@ export class UserAuditSubscriber implements EntitySubscriberInterface<User> {
       }
     }
 
-    // Nếu không có trường nào trong danh sách cho phép thay đổi thì không ghi audit
     if (changedFields.length === 0) {
       return;
     }
@@ -112,7 +124,53 @@ export class UserAuditSubscriber implements EntitySubscriberInterface<User> {
       after_data: afterDiff,
     });
 
-    // Cập nhật lại bản chụp mới nhất vào WeakMap cho các lần thao tác tiếp theo trên cùng instance
     this.loadedSnapshots.set(updatedEntity, { ...afterSnapshot });
+  }
+
+  async afterSoftRemove(event: SoftRemoveEvent<User>): Promise<void> {
+    const removedEntity = event.entity as User | undefined;
+    if (!removedEntity) {
+      return;
+    }
+    await this.recordSoftDeleteAuditIfNeeded(
+      event.manager,
+      removedEntity,
+      event.databaseEntity,
+    );
+  }
+
+  private async recordSoftDeleteAuditIfNeeded(
+    manager: SoftRemoveEvent<User>['manager'],
+    entity: User,
+    databaseEntity?: User,
+  ): Promise<void> {
+    if (this.softDeletedRecorded.has(entity)) {
+      return;
+    }
+    this.softDeletedRecorded.add(entity);
+
+    const beforeSnapshot =
+      this.loadedSnapshots.get(entity) ??
+      pickAllowedUserAuditSnapshot(databaseEntity) ??
+      pickAllowedUserAuditSnapshot(entity);
+
+    const context = getRequestContextSnapshot();
+
+    await manager.insert(AuditLog, {
+      actor_id: context.actorId,
+      action: AuditAction.USER_SOFT_DELETED,
+      entity: AuditEntity.USERS,
+      entity_id: entity.id ?? databaseEntity?.id ?? null,
+      ip_address: context.ipAddress
+        ? context.ipAddress.slice(0, MAX_IP_ADDRESS_LENGTH)
+        : null,
+      user_agent: context.userAgent
+        ? context.userAgent.slice(0, MAX_USER_AGENT_LENGTH)
+        : null,
+      before_data: beforeSnapshot,
+      after_data: {
+        deletedAt: (entity.deleted_at ?? new Date()).toISOString(),
+      } as Record<string, any>,
+    });
   }
 }

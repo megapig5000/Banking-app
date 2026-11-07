@@ -56,7 +56,7 @@ export async function createTestApp(): Promise<{
  */
 export async function resetDatabase(dataSource: DataSource): Promise<void> {
   await dataSource.query(
-    'TRUNCATE TABLE "audit_logs", "idempotency_keys", "ledger_entries", "transactions", "accounts", "users" RESTART IDENTITY CASCADE',
+    'TRUNCATE TABLE "account_history", "audit_logs", "idempotency_keys", "ledger_entries", "transactions", "accounts", "users" RESTART IDENTITY CASCADE',
   );
 }
 
@@ -165,6 +165,37 @@ export async function assertAuditInvariants(
            OR before_data->>'status' IS NOT DISTINCT FROM after_data->>'status')
   `);
   expect(q7Violations).toEqual([]);
+}
+
+/**
+ * Kiểm tra bộ 3 bất biến của Module 5 (Q8, Q9, Q10 - Trạng thái tài khoản, Hold & Xóa mềm).
+ * Kỳ vọng cả 3 truy vấn đều trả về 0 dòng sai lệch.
+ */
+export async function assertModule5Invariants(
+  dataSource: DataSource,
+): Promise<void> {
+  // Q8: Số dư và hold luôn hợp lệ
+  const q8Violations = await dataSource.query(`
+    SELECT id FROM "accounts"
+    WHERE balance < 0 OR hold_amount < 0 OR hold_amount > balance
+  `);
+  expect(q8Violations).toEqual([]);
+
+  // Q9: Tài khoản đã xóa mềm luôn CLOSED, không còn tiền hay hold
+  const q9Violations = await dataSource.query(`
+    SELECT id FROM "accounts"
+    WHERE deleted_at IS NOT NULL
+      AND (status <> 'CLOSED' OR balance <> 0 OR hold_amount <> 0)
+  `);
+  expect(q9Violations).toEqual([]);
+
+  // Q10: User và tài khoản luôn bị xóa mềm cùng nhau
+  const q10Violations = await dataSource.query(`
+    SELECT u.id FROM "users" u
+    JOIN "accounts" a ON a.user_id = u.id
+    WHERE (u.deleted_at IS NULL) <> (a.deleted_at IS NULL)
+  `);
+  expect(q10Violations).toEqual([]);
 }
 
 /**

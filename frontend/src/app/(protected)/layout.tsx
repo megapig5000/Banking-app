@@ -45,8 +45,8 @@ export default function ProtectedLayout({
       <nav className="bg-blue-800 shadow-md">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
-            <div className="flex items-center space-x-4">
-              <span className="text-white font-bold text-xl mr-4">
+            <div className="flex items-center space-x-3 sm:space-x-4">
+              <span className="text-white font-bold text-xl mr-2 sm:mr-4">
                 SimpleBank
               </span>
               <Link href="/dashboard" className={navClass("/dashboard")}>
@@ -60,6 +60,9 @@ export default function ProtectedLayout({
               </Link>
               <Link href="/transactions" className={navClass("/transactions")}>
                 Lịch sử
+              </Link>
+              <Link href="/profile" className={navClass("/profile")}>
+                Hồ sơ
               </Link>
             </div>
             <div className="flex items-center space-x-4">

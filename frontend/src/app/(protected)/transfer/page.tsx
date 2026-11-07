@@ -1,69 +1,45 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
 import { api, submitIdempotentTransaction } from "@/services/api";
 
-type TransactionType = "TRANSFER" | "DEPOSIT" | "WITHDRAW" | "REVERSAL";
-type TransactionStatus =
-  | "INITIATED"
-  | "PENDING_OTP"
-  | "PROCESSING"
-  | "COMPLETED"
-  | "FAILED"
-  | "REVERSED";
+interface AccountLimits {
+  perTransaction: string;
+  perDay: string;
+  usedToday: string;
+  remainingToday: string;
+}
 
-interface Account {
-  id: string;
+interface AccountInfo {
   accountNumber: string;
   balance: string;
+  holdAmount: string;
+  availableBalance: string;
+  status: "ACTIVE" | "FROZEN" | "CLOSED";
+  tier: "STANDARD" | "VIP";
+  limits?: AccountLimits;
   currency: string;
-  ownerName: string;
 }
 
 interface TransactionItem {
   id: string;
   amount: string;
-  type: TransactionType;
-  status: TransactionStatus;
+  type: "TRANSFER" | "DEPOSIT" | "WITHDRAW" | "REVERSAL";
+  status:
+    | "INITIATED"
+    | "PENDING_OTP"
+    | "PROCESSING"
+    | "COMPLETED"
+    | "FAILED"
+    | "REVERSAL"
+    | "REVERSED";
   description: string | null;
   createdAt: string;
   direction: "incoming" | "outgoing";
   counterpartyAccountNumber: string | null;
-  originalTransactionId?: string | null;
-  reversalTransactionId?: string | null;
 }
-
-const STATUS_LABELS: Record<
-  TransactionStatus,
-  { label: string; className: string }
-> = {
-  COMPLETED: {
-    label: "Thành công",
-    className: "bg-green-100 text-green-800",
-  },
-  REVERSED: {
-    label: "Đã được hoàn tiền",
-    className: "bg-purple-100 text-purple-800",
-  },
-  PROCESSING: {
-    label: "Đang xử lý",
-    className: "bg-blue-100 text-blue-800",
-  },
-  INITIATED: {
-    label: "Khởi tạo",
-    className: "bg-gray-100 text-gray-800",
-  },
-  PENDING_OTP: {
-    label: "Chờ OTP",
-    className: "bg-yellow-100 text-yellow-800",
-  },
-  FAILED: {
-    label: "Thất bại",
-    className: "bg-red-100 text-red-800",
-  },
-};
 
 export default function TransferPage() {
   const [formData, setFormData] = useState({
@@ -71,21 +47,20 @@ export default function TransferPage() {
     amount: "",
     description: "",
   });
-  const [idempotencyKey, setIdempotencyKey] = useState(() => uuidv4());
+  // Khởi tạo trực tiếp UUID bằng lazy initializer để không cần gọi setState đồng bộ trong useEffect
+  const [idempotencyKey, setIdempotencyKey] = useState<string>(() => uuidv4());
   const [loading, setLoading] = useState(false);
   const [retryStatus, setRetryStatus] = useState<string | null>(null);
   const [message, setMessage] = useState<{
-    type: "success" | "error" | "warning" | "";
+    type: "success" | "error" | "info" | "warning";
     text: string;
-  }>({ type: "", text: "" });
-
-  // Cờ khóa đồng bộ bằng useRef để chặn bấm đúp trong cùng một tích tắc trước khi React kịp re-render
-  const inFlightRef = useRef(false);
-
-  const [account, setAccount] = useState<Account | null>(null);
+  } | null>(null);
+  const [account, setAccount] = useState<AccountInfo | null>(null);
   const [recentTransactions, setRecentTransactions] = useState<
     TransactionItem[]
   >([]);
+
+  const inFlightRef = useRef(false);
 
   const fetchAccountAndRecentTransactions = useCallback(async () => {
     try {
@@ -94,27 +69,28 @@ export default function TransferPage() {
         api.get("/transactions?page=1&limit=5&order=desc"),
       ]);
       setAccount(accRes.data);
-      setRecentTransactions(txRes.data.data);
-    } catch (error) {
-      console.error("Lỗi tải dữ liệu tài khoản và lịch sử", error);
+      setRecentTransactions(txRes.data.data || []);
+    } catch (err) {
+      console.error("Lỗi tải dữ liệu tài khoản/lịch sử:", err);
     }
   }, []);
 
   useEffect(() => {
     let active = true;
-    Promise.all([
-      api.get("/accounts/me"),
-      api.get("/transactions?page=1&limit=5&order=desc"),
-    ])
-      .then(([accRes, txRes]) => {
+    const loadInitialData = async () => {
+      try {
+        const [accRes, txRes] = await Promise.all([
+          api.get("/accounts/me"),
+          api.get("/transactions?page=1&limit=5&order=desc"),
+        ]);
         if (!active) return;
         setAccount(accRes.data);
-        setRecentTransactions(txRes.data.data);
-      })
-      .catch((error) => {
-        console.error("Lỗi tải dữ liệu tài khoản và lịch sử", error);
-      });
-
+        setRecentTransactions(txRes.data.data || []);
+      } catch (err) {
+        console.error("Lỗi tải dữ liệu tài khoản/lịch sử:", err);
+      }
+    };
+    void loadInitialData();
     return () => {
       active = false;
     };
@@ -123,73 +99,132 @@ export default function TransferPage() {
   const handleChange = (
     e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
   ) => {
-    if (inFlightRef.current) return;
+    if (loading) return;
     setFormData({ ...formData, [e.target.name]: e.target.value });
     setIdempotencyKey(uuidv4());
-    setMessage({ type: "", text: "" });
+    setMessage(null);
   };
+
+  const formatMoney = (val: string) =>
+    new Intl.NumberFormat("vi-VN").format(parseFloat(val || "0"));
+
+  const getClientHintWarning = (): string | null => {
+    if (!account) return null;
+    if (account.status !== "ACTIVE") {
+      return `Tài khoản nguồn hiện đang ở trạng thái ${account.status} (không phải ACTIVE). Giao dịch gửi lên sẽ bị máy chủ từ chối.`;
+    }
+
+    const amountRegex = /^\d{1,16}(\.\d{1,2})?$/;
+    const trimmed = formData.amount.trim();
+    if (!trimmed || !amountRegex.test(trimmed)) return null;
+
+    const amountNum = parseFloat(trimmed);
+    if (amountNum <= 0) return null;
+
+    if (account.limits) {
+      const perTxNum = parseFloat(account.limits.perTransaction);
+      const remDayNum = parseFloat(account.limits.remainingToday);
+
+      if (amountNum > perTxNum) {
+        return `Gợi ý hạn mức: Số tiền nhập vào vượt hạn mức mỗi lần của hạng ${account.tier} (${formatMoney(account.limits.perTransaction)} ${account.currency}).`;
+      }
+      if (amountNum > remDayNum) {
+        return `Gợi ý hạn mức: Số tiền nhập vào vượt hạn mức còn lại trong ngày hôm nay (${formatMoney(account.limits.remainingToday)} ${account.currency}).`;
+      }
+    }
+
+    const availNum = parseFloat(account.availableBalance);
+    if (amountNum > availNum) {
+      return `Gợi ý số dư: Số tiền nhập vào vượt quá số dư khả dụng hiện tại (${formatMoney(account.availableBalance)} ${account.currency}).`;
+    }
+
+    return null;
+  };
+
+  const clientWarning = getClientHintWarning();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    // Chặn ngay lần bấm thứ hai trong cùng tích tắc bằng cờ đồng bộ useRef
     if (inFlightRef.current) {
       return;
     }
+
+    const amountRegex = /^\d{1,16}(\.\d{1,2})?$/;
+    if (
+      !amountRegex.test(formData.amount) ||
+      parseFloat(formData.amount) <= 0
+    ) {
+      setMessage({
+        type: "error",
+        text: "Số tiền không hợp lệ (phải lớn hơn 0 và tối đa 2 chữ số thập phân).",
+      });
+      return;
+    }
+
     inFlightRef.current = true;
     setLoading(true);
     setRetryStatus(null);
-    setMessage({ type: "", text: "" });
+    setMessage(null);
 
     try {
       const result = await submitIdempotentTransaction<TransactionItem>(
         "/transactions/transfer",
-        formData,
+        {
+          toAccountNumber: formData.toAccountNumber.trim(),
+          amount: formData.amount.trim(),
+          description: formData.description.trim() || undefined,
+        },
         idempotencyKey,
         (attempt, maxRetries) => {
           setRetryStatus(`Đang thử lại (lần ${attempt}/${maxRetries})...`);
         },
       );
 
-      // Nếu hết số lần thử lại mà vẫn chưa biết kết quả (timeout/mất mạng/202 kéo dài):
-      // Trả về trạng thái "chưa xác định" và GIỮ NGUYÊN idempotencyKey để bấm gửi lại an toàn!
       if (result.outcome === "indeterminate") {
-        const txHint = result.lastTransactionId
-          ? ` (Mã GD tạm thời: ${result.lastTransactionId})`
-          : "";
         setMessage({
           type: "warning",
-          text: `Chưa xác nhận được giao dịch${txHint}. Vui lòng kiểm tra Lịch sử giao dịch trước khi thử lại, hoặc bấm Xác nhận chuyển khoản để kiểm tra lại với cùng mã giao dịch.`,
+          text: "Chưa xác nhận được giao dịch. Vui lòng kiểm tra Lịch sử giao dịch trước khi thử lại, hoặc bấm xác nhận lại (hệ thống đang giữ nguyên mã chống trùng để kiểm tra an toàn).",
         });
-        void fetchAccountAndRecentTransactions();
+        await fetchAccountAndRecentTransactions();
         return;
       }
 
+      const isReplay = result.status === 200;
       setMessage({
         type: "success",
-        text: `Chuyển khoản thành công! Mã GD: ${result.data.id}`,
+        text: isReplay
+          ? "Giao dịch đã được xử lý trước đó (kết quả phát lại từ bản chụp Idempotency)."
+          : "Chuyển khoản thành công!",
       });
+
       setFormData({ toAccountNumber: "", amount: "", description: "" });
-      // Phản hồi kết thúc thành công (201/200) -> sinh Idempotency-Key mới
       setIdempotencyKey(uuidv4());
 
       await fetchAccountAndRecentTransactions();
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
-        // Khi có err.response (server đã trả về lỗi cuối cùng 4xx/5xx): sinh Idempotency-Key mới
         if (err.response) {
+          const msg = err.response.data?.message;
+          setMessage({
+            type: "error",
+            text: Array.isArray(msg)
+              ? msg[0]
+              : msg || "Có lỗi xảy ra khi chuyển khoản.",
+          });
           setIdempotencyKey(uuidv4());
-          void fetchAccountAndRecentTransactions();
+          await fetchAccountAndRecentTransactions();
+        } else {
+          setMessage({
+            type: "warning",
+            text: "Chưa xác nhận được giao dịch do mất kết nối mạng. Bạn có thể bấm xác nhận lại (mã giao dịch được giữ nguyên để không bị trừ tiền hai lần).",
+          });
         }
-        const msg = err.response?.data?.message;
+      } else {
         setMessage({
           type: "error",
-          text: Array.isArray(msg)
-            ? msg[0]
-            : msg || "Không thể thực hiện giao dịch, vui lòng thử lại",
+          text: "Có lỗi không xác định xảy ra.",
         });
-      } else {
-        setMessage({ type: "error", text: "Lỗi hệ thống" });
       }
     } finally {
       inFlightRef.current = false;
@@ -198,193 +233,243 @@ export default function TransferPage() {
     }
   };
 
-  const formatMoney = (amount: string) =>
-    new Intl.NumberFormat("vi-VN").format(parseFloat(amount));
-  const formatDate = (dateStr: string) =>
-    new Date(dateStr).toLocaleString("vi-VN");
-
-  const getTypeLabel = (type: TransactionType) => {
-    switch (type) {
-      case "DEPOSIT":
-        return "Nạp tiền";
-      case "WITHDRAW":
-        return "Rút tiền";
-      case "REVERSAL":
-        return "Hoàn tiền";
+  const renderStatusBadge = (status: TransactionItem["status"]) => {
+    switch (status) {
+      case "COMPLETED":
+        return (
+          <span className="text-xs px-2 py-0.5 rounded bg-green-100 text-green-700 font-medium">
+            Thành công
+          </span>
+        );
+      case "REVERSED":
+        return (
+          <span className="text-xs px-2 py-0.5 rounded bg-purple-100 text-purple-700 font-medium">
+            Đã hoàn tiền
+          </span>
+        );
+      case "PROCESSING":
+      case "INITIATED":
+      case "PENDING_OTP":
+        return (
+          <span className="text-xs px-2 py-0.5 rounded bg-blue-100 text-blue-700 font-medium">
+            Đang xử lý
+          </span>
+        );
+      case "FAILED":
+        return (
+          <span className="text-xs px-2 py-0.5 rounded bg-red-100 text-red-700 font-medium">
+            Thất bại
+          </span>
+        );
       default:
-        return "Chuyển khoản";
+        return null;
     }
   };
 
   return (
-    <div className="max-w-3xl mx-auto mt-8 space-y-6">
-      {account && (
-        <div className="bg-white rounded-lg shadow-md p-5 border border-gray-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-          <div>
-            <p className="text-sm text-gray-500">
-              Tài khoản nguồn:{" "}
-              <span className="font-mono font-semibold text-gray-800">
-                {account.accountNumber}
-              </span>
-            </p>
-            <p className="text-sm text-gray-500">
-              Chủ tài khoản:{" "}
-              <span className="font-medium text-gray-800">
-                {account.ownerName}
-              </span>
-            </p>
-          </div>
-          <div className="sm:text-right">
-            <p className="text-xs text-gray-500 uppercase">Số dư khả dụng</p>
-            <p className="text-2xl font-bold text-green-700">
-              {formatMoney(account.balance)} {account.currency}
-            </p>
-          </div>
-        </div>
-      )}
-
+    <div className="max-w-2xl mx-auto mt-8 space-y-6 px-4 sm:px-0">
       <div className="bg-white rounded-lg shadow-md p-6 border border-gray-200">
-        <h2 className="text-2xl font-bold text-gray-800 mb-6 border-b pb-2">
-          Chuyển khoản nội bộ
-        </h2>
+        <div className="flex flex-wrap justify-between items-start gap-2 mb-6 border-b pb-3">
+          <div>
+            <h2 className="text-2xl font-bold text-gray-800">
+              Chuyển khoản nội bộ
+            </h2>
+            {account && (
+              <p className="text-xs text-gray-500 mt-1">
+                STK: <strong>{account.accountNumber}</strong> | Hạng:{" "}
+                <strong className="text-blue-700">{account.tier}</strong> |
+                Trạng thái:{" "}
+                <strong
+                  className={
+                    account.status === "ACTIVE"
+                      ? "text-emerald-700"
+                      : "text-red-600"
+                  }
+                >
+                  {account.status}
+                </strong>
+              </p>
+            )}
+          </div>
+          {account && (
+            <div className="text-right">
+              <span className="text-xs text-gray-500 block">
+                Số dư khả dụng
+              </span>
+              <span className="text-lg font-bold text-green-700">
+                {formatMoney(account.availableBalance)} {account.currency}
+              </span>
+              {parseFloat(account.holdAmount || "0") > 0 && (
+                <span className="text-xs text-amber-700 block">
+                  (Đang giữ chỗ: {formatMoney(account.holdAmount)}{" "}
+                  {account.currency})
+                </span>
+              )}
+            </div>
+          )}
+        </div>
 
-        {retryStatus && (
-          <div className="mb-4 p-4 rounded-md bg-blue-50 border border-blue-200 text-blue-800 text-sm font-medium">
-            {retryStatus} Hệ thống đang giữ nguyên mã giao dịch để đảm bảo không
-            trừ tiền hai lần.
+        {account?.limits && (
+          <div className="mb-5 p-3 bg-slate-50 border border-slate-200 rounded-md text-xs text-gray-700 flex flex-wrap justify-between gap-2">
+            <span>
+              Hạn mức mỗi lần ({account.tier}):{" "}
+              <strong className="text-gray-900">
+                {formatMoney(account.limits.perTransaction)} {account.currency}
+              </strong>
+            </span>
+            <span>
+              Hạn mức ngày còn lại hôm nay:{" "}
+              <strong className="text-emerald-700">
+                {formatMoney(account.limits.remainingToday)} {account.currency}
+              </strong>{" "}
+              / {formatMoney(account.limits.perDay)} {account.currency}
+            </span>
           </div>
         )}
 
-        {message.text && (
+        {retryStatus && (
+          <div className="p-4 mb-4 rounded-md bg-blue-50 text-blue-800 border border-blue-200 flex items-center justify-between">
+            <span className="font-medium">{retryStatus}</span>
+            <span className="text-xs text-blue-600">
+              Đang dùng lại cùng Idempotency-Key
+            </span>
+          </div>
+        )}
+
+        {message && (
           <div
-            className={`mb-4 p-4 rounded-md ${
+            className={`p-4 mb-4 rounded-md border ${
               message.type === "success"
-                ? "bg-green-100 text-green-800"
-                : message.type === "warning"
-                  ? "bg-amber-100 text-amber-900 border border-amber-300"
-                  : "bg-red-100 text-red-800"
+                ? "bg-green-50 text-green-800 border-green-200"
+                : message.type === "info"
+                  ? "bg-blue-50 text-blue-800 border-blue-200"
+                  : message.type === "warning"
+                    ? "bg-amber-50 text-amber-900 border-amber-300"
+                    : "bg-red-50 text-red-800 border-red-200"
             }`}
           >
             {message.text}
           </div>
         )}
 
+        {clientWarning && (
+          <div className="p-3 mb-4 rounded-md bg-amber-50 text-amber-900 border border-amber-300 text-sm">
+            <p className="font-semibold">{clientWarning}</p>
+          </div>
+        )}
+
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-gray-700">
-              Tài khoản đích
+              Số tài khoản người nhận
             </label>
             <input
               type="text"
               name="toAccountNumber"
               required
               disabled={loading}
-              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900 disabled:bg-gray-100"
               value={formData.toAccountNumber}
               onChange={handleChange}
-              placeholder="VD: 1000000002"
+              placeholder="Nhập số tài khoản (VD: 1000000002)"
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2.5 border text-gray-900 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
             />
           </div>
+
           <div>
             <label className="block text-sm font-medium text-gray-700">
               Số tiền (VND)
             </label>
             <input
-              type="number"
+              type="text"
               name="amount"
               required
-              min="1"
-              step="0.01"
               disabled={loading}
-              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900 disabled:bg-gray-100"
               value={formData.amount}
               onChange={handleChange}
               placeholder="VD: 50000"
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2.5 border text-gray-900 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
             />
           </div>
+
           <div>
             <label className="block text-sm font-medium text-gray-700">
               Nội dung chuyển khoản (Tùy chọn)
             </label>
             <textarea
               name="description"
-              maxLength={200}
               rows={3}
+              maxLength={200}
               disabled={loading}
-              className="mt-1 block w-full border border-gray-300 rounded-md p-2 focus:ring-blue-500 focus:border-blue-500 text-gray-900 disabled:bg-gray-100"
               value={formData.description}
               onChange={handleChange}
-            ></textarea>
+              placeholder="Nhập tối đa 200 ký tự..."
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2.5 border text-gray-900 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
+            />
           </div>
+
           <button
             type="submit"
             disabled={loading}
-            className="w-full bg-blue-600 text-white p-3 rounded-md font-semibold hover:bg-blue-700 disabled:opacity-50 transition"
+            className="w-full py-2.5 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed transition"
           >
-            {loading
-              ? retryStatus || "Đang thực hiện..."
-              : "Xác nhận chuyển khoản"}
+            {retryStatus
+              ? retryStatus
+              : loading
+                ? "Đang xử lý giao dịch..."
+                : "Xác nhận chuyển khoản"}
           </button>
         </form>
       </div>
 
       <div className="bg-white rounded-lg shadow-md p-6 border border-gray-200">
-        <h3 className="text-lg font-bold text-gray-800 mb-4">
+        <h3 className="text-lg font-bold text-gray-800 mb-4 border-b pb-2">
           Giao dịch gần đây
         </h3>
         {recentTransactions.length === 0 ? (
-          <p className="text-sm text-gray-500">Chưa có giao dịch nào.</p>
+          <p className="text-sm text-gray-500 text-center py-4">
+            Chưa có giao dịch nào.
+          </p>
         ) : (
           <div className="divide-y divide-gray-200">
             {recentTransactions.map((tx) => {
-              const statusBadge = STATUS_LABELS[tx.status] ?? {
-                label: tx.status,
-                className: "bg-gray-100 text-gray-800",
-              };
               const isFailed = tx.status === "FAILED";
-
               return (
                 <div
                   key={tx.id}
-                  className="py-3 flex items-center justify-between text-sm"
+                  className="py-3 flex justify-between items-center text-sm"
                 >
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="font-medium text-gray-900">
-                        {getTypeLabel(tx.type)}
-                      </span>
-                      <span className="text-gray-500">
-                        ({tx.counterpartyAccountNumber ?? "Tiền mặt"})
-                      </span>
-                      <span
-                        className={`px-2 py-0.5 rounded text-xs font-medium ${statusBadge.className}`}
-                      >
-                        {statusBadge.label}
-                      </span>
-                    </div>
-                    {tx.description && (
-                      <p className="text-xs text-gray-500 mt-0.5">
-                        {tx.description}
+                      <p className="font-medium text-gray-800">
+                        {tx.type === "DEPOSIT"
+                          ? "Nạp tiền (Tiền mặt)"
+                          : tx.type === "WITHDRAW"
+                            ? "Rút tiền (Tiền mặt)"
+                            : tx.type === "REVERSAL"
+                              ? `Hoàn tiền (${tx.counterpartyAccountNumber || "Hệ thống"})`
+                              : tx.direction === "incoming"
+                                ? `Nhận từ: ${tx.counterpartyAccountNumber || "Tiền mặt"}`
+                                : `Chuyển tới: ${tx.counterpartyAccountNumber || "Tiền mặt"}`}
                       </p>
-                    )}
-                  </div>
-                  <div className="text-right">
-                    <p
-                      className={`font-bold ${
-                        isFailed
-                          ? "text-gray-400 line-through"
-                          : tx.direction === "incoming"
-                            ? "text-green-600"
-                            : "text-red-600"
-                      }`}
-                    >
-                      {tx.direction === "incoming" ? "+" : "-"}
-                      {formatMoney(tx.amount)} VND
-                    </p>
-                    <p className="text-xs text-gray-400">
-                      {formatDate(tx.createdAt)}
+                      {renderStatusBadge(tx.status)}
+                    </div>
+                    <p className="text-xs text-gray-500">
+                      {new Date(tx.createdAt).toLocaleString("vi-VN")}
+                      {tx.description ? ` — ${tx.description}` : ""}
                     </p>
                   </div>
+                  <span
+                    className={`font-bold ${
+                      isFailed
+                        ? "text-gray-400 line-through"
+                        : tx.direction === "incoming"
+                          ? "text-green-600"
+                          : "text-red-600"
+                    }`}
+                  >
+                    {tx.direction === "incoming" ? "+" : "-"}
+                    {formatMoney(tx.amount)} VND
+                  </span>
                 </div>
               );
             })}

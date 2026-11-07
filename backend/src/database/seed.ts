@@ -1,6 +1,6 @@
 import AppDataSource from './data-source';
 import { User, UserRole, UserStatus } from './entities/user.entity';
-import { Account } from './entities/account.entity';
+import { Account, AccountStatus, AccountTier } from './entities/account.entity';
 import {
   Transaction,
   TransactionType,
@@ -19,9 +19,10 @@ async function runSeed() {
   try {
     const passwordHash = await bcrypt.hash('Password@123', 10);
 
-    // 0. Tạo System Admin (phục vụ nghiệp vụ hoàn tiền REVERSAL - Module 3B)
+    // 0. Tạo System Admin (phục vụ nghiệp vụ hoàn tiền REVERSAL & Admin APIs)
     let adminUser = await queryRunner.manager.findOne(User, {
       where: { email: 'admin@bank.local' },
+      withDeleted: true,
     });
     if (!adminUser) {
       adminUser = queryRunner.manager.create(User, {
@@ -38,15 +39,19 @@ async function runSeed() {
           user_id: adminUser.id,
           account_number: '1000000000',
           balance: '0.00',
+          hold_amount: '0.00',
+          status: AccountStatus.ACTIVE,
+          tier: AccountTier.STANDARD,
           currency: 'VND',
         }),
       );
       console.log('Created Admin User (admin@bank.local)');
     }
 
-    // 1. Tạo Customer A
+    // 1. Tạo Customer A (STANDARD)
     let user1 = await queryRunner.manager.findOne(User, {
       where: { email: 'user1@bank.local' },
+      withDeleted: true,
     });
     if (!user1) {
       user1 = queryRunner.manager.create(User, {
@@ -63,15 +68,19 @@ async function runSeed() {
           user_id: user1.id,
           account_number: '1000000001',
           balance: '5000000.00',
+          hold_amount: '0.00',
+          status: AccountStatus.ACTIVE,
+          tier: AccountTier.STANDARD,
           currency: 'VND',
         }),
       );
-      console.log('Created User 1 (Customer A)');
+      console.log('Created User 1 (Customer A - STANDARD)');
     }
 
-    // 2. Tạo Customer B
+    // 2. Tạo Customer B (VIP)
     let user2 = await queryRunner.manager.findOne(User, {
       where: { email: 'user2@bank.local' },
+      withDeleted: true,
     });
     if (!user2) {
       user2 = queryRunner.manager.create(User, {
@@ -88,15 +97,26 @@ async function runSeed() {
           user_id: user2.id,
           account_number: '1000000002',
           balance: '2000000.00',
+          hold_amount: '0.00',
+          status: AccountStatus.ACTIVE,
+          tier: AccountTier.VIP,
           currency: 'VND',
         }),
       );
-      console.log('Created User 2 (Customer B)');
+      console.log('Created User 2 (Customer B - VIP)');
+    } else {
+      // Đảm bảo tài khoản 1000000002 trên DB cũ cũng được đồng bộ tier = VIP
+      await queryRunner.manager.update(
+        Account,
+        { account_number: '1000000002' },
+        { tier: AccountTier.VIP },
+      );
     }
 
-    // 3. Tạo Locked Customer
+    // 3. Tạo Locked Customer (STANDARD)
     let user3 = await queryRunner.manager.findOne(User, {
       where: { email: 'user3@bank.local' },
+      withDeleted: true,
     });
     if (!user3) {
       user3 = queryRunner.manager.create(User, {
@@ -113,21 +133,27 @@ async function runSeed() {
           user_id: user3.id,
           account_number: '1000000003',
           balance: '1000000.00',
+          hold_amount: '0.00',
+          status: AccountStatus.ACTIVE,
+          tier: AccountTier.STANDARD,
           currency: 'VND',
         }),
       );
-      console.log('Created User 3 (Locked Customer)');
+      console.log('Created User 3 (Locked Customer - STANDARD)');
     }
 
-    // 4. Seed Transaction History nhất quán với số dư
+    // 4. Seed Transaction History nhất quán với số dư (dùng withDeleted: true để luôn tìm thấy tài khoản mẫu)
     const acc1 = await queryRunner.manager.findOne(Account, {
       where: { account_number: '1000000001' },
+      withDeleted: true,
     });
     const acc2 = await queryRunner.manager.findOne(Account, {
       where: { account_number: '1000000002' },
+      withDeleted: true,
     });
     const acc3 = await queryRunner.manager.findOne(Account, {
       where: { account_number: '1000000003' },
+      withDeleted: true,
     });
 
     if (!acc1 || !acc2 || !acc3) {
