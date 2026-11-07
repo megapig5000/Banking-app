@@ -8,8 +8,10 @@ export interface User {
   id: string;
   fullName: string;
   email: string;
+  phone?: string | null;
+  profileVersion?: number;
   role: UserRole;
-  status: UserStatus;
+  status: UserStatus | string;
 }
 
 interface AuthState {
@@ -18,6 +20,8 @@ interface AuthState {
   authenticated: boolean;
   hydrated: boolean;
   login: (user: User, accessToken: string) => void;
+  setAuth: (user: User, accessToken: string) => void;
+  updateUser: (partialUser: Partial<User>) => void;
   logout: () => void;
   setHydrated: (state: boolean) => void;
 }
@@ -29,16 +33,29 @@ export const useAuthStore = create<AuthState>()(
       accessToken: null,
       authenticated: false,
       hydrated: false,
+
       login: (user, accessToken) =>
         set({ user, accessToken, authenticated: true }),
+
+      setAuth: (user, accessToken) =>
+        set({ user, accessToken, authenticated: true }),
+
+      updateUser: (partialUser) =>
+        set((state) => ({
+          user: state.user ? { ...state.user, ...partialUser } : null,
+        })),
+
       logout: () =>
         set({ user: null, accessToken: null, authenticated: false }),
+
       setHydrated: (state) => set({ hydrated: state }),
     }),
     {
-      name: "auth-storage", // Lưu mặc định vào localStorage
+      name: "auth-storage",
       onRehydrateStorage: () => (state) => {
-        if (state) state.setHydrated(true);
+        if (state) {
+          state.setHydrated(true);
+        }
       },
     },
   ),
