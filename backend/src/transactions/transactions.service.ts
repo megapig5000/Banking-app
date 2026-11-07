@@ -19,7 +19,7 @@ import {
   QueryRunner,
   Repository,
 } from 'typeorm';
-import { Account } from '../database/entities/account.entity';
+import { Account, AccountStatus } from '../database/entities/account.entity';
 import {
   Transaction,
   TransactionType,
@@ -43,8 +43,11 @@ import {
 } from './dto/transaction-query.dto';
 import { sanitizeHtml } from '../common/utils/sanitize.util';
 import {
+  calculateAccountLimits,
+  formatVndCurrency,
   getVietnamDayStart,
   getVietnamNextDayStart,
+  parseDecimalToCents,
 } from '../common/utils/date.util';
 import {
   canTransition,
@@ -95,12 +98,19 @@ export interface SweepStuckResult {
 }
 
 /**
- * Lỗi nghiệp vụ nội bộ mang sẵn TransactionFailureCode để Pha C ghi nhận chính xác
+ * Lỗi nghiệp vụ nội bộ mang sẵn TransactionFailureCode (và thông báo tùy chỉnh nếu có)
+ * để Pha C ghi nhận chính xác vào transactions.failure_code và idempotency_keys.response_body.
  */
 class BusinessTransactionError extends Error {
-  constructor(public readonly failureCode: TransactionFailureCode) {
-    super(FAILURE_CODE_MAP[failureCode].message);
+  public readonly customMessage?: string;
+
+  constructor(
+    public readonly failureCode: TransactionFailureCode,
+    customMessage?: string,
+  ) {
+    super(customMessage || FAILURE_CODE_MAP[failureCode].message);
     this.name = 'BusinessTransactionError';
+    this.customMessage = customMessage;
   }
 }
 
@@ -108,7 +118,6 @@ class BusinessTransactionError extends Error {
 export class TransactionsService {
   private readonly logger = new Logger(TransactionsService.name);
 
-  // Bộ đếm trong bộ nhớ phục vụ theo dõi Deadlock & Retry (Bài 1.4)
   private readonly deadlockStats: DeadlockStats = {
     deadlockDetected: 0,
     retrySucceeded: 0,
@@ -132,10 +141,6 @@ export class TransactionsService {
   // STATE MACHINE: CHUYỂN TRẠNG THÁI CÓ ĐIỀU KIỆN (BÀI 3.2 & 5.3)
   // =========================================================================
 
-  /**
-   * Hàm duy nhất được phép thay đổi cột `status` của bảng `transactions`.
-   * Thực hiện đóng dấu có điều kiện: UPDATE ... SET status = :to, updated_at = now() WHERE id = :id AND status = :from
-   */
   async transition(
     manager: EntityManager,
     transactionId: string,
@@ -179,10 +184,6 @@ export class TransactionsService {
   // JOB QUÉT GIAO DỊCH TREO (STUCK TRANSACTIONS SWEEP - BÀI 5.3 & MODULE 2)
   // =========================================================================
 
-  /**
-   * Cron job tự động chạy mỗi phút để phát hiện và đóng dấu FAILED (TIMEOUT) cho các giao dịch treo.
-   * Trong môi trường test (NODE_ENV === 'test'), tắt lịch tự chạy để test chủ động gọi sweepStuckTransactions().
-   */
   @Cron(CronExpression.EVERY_MINUTE)
   async handleStuckTransactionsCron(): Promise<void> {
     if (process.env.NODE_ENV === 'test') {
@@ -191,12 +192,6 @@ export class TransactionsService {
     await this.sweepStuckTransactions();
   }
 
-  /**
-   * Tìm các giao dịch PROCESSING có updated_at cũ hơn STUCK_AFTER_SECONDS (mặc định 120s):
-   * - Nếu chưa có bút toán nào trong ledger_entries: trong CÙNG 1 transaction, chuyển giao dịch sang FAILED (TIMEOUT)
-   *   và đóng luôn dòng khóa idempotency_keys tương ứng sang FAILED (503).
-   * - Nếu đã có bút toán trong ledger_entries (bất thường trái thiết kế): log ERROR và giữ nguyên để xử lý thủ công.
-   */
   async sweepStuckTransactions(
     stuckAfterSeconds: number = STUCK_AFTER_SECONDS,
   ): Promise<SweepStuckResult> {
@@ -264,7 +259,7 @@ export class TransactionsService {
           `[StuckTransactionSwept] Đã đánh dấu FAILED (TIMEOUT) cho giao dịch treo và đóng khóa Idempotency: id=${candidate.id}, type=${candidate.type}`,
         );
       } catch {
-        // Nếu ngay lúc quét mà giao dịch vừa được Pha B chuyển sang COMPLETED/FAILED thì bỏ qua an toàn
+        // Bỏ qua an toàn nếu vừa được hoàn tất
       }
     }
 
@@ -278,7 +273,7 @@ export class TransactionsService {
   }
 
   // =========================================================================
-  // LỊCH SỬ GIAO DỊCH (CÓ originalTransactionId & reversalTransactionId)
+  // LỊCH SỬ GIAO DỊCH (DÙNG .withDeleted() ĐỂ GIỮ SỐ TK ĐỐI TÁC ĐÃ XÓA MỀM)
   // =========================================================================
 
   async getTransactions(userId: string, query: TransactionQueryDto) {
@@ -303,8 +298,10 @@ export class TransactionsService {
     }
     const accountId = account.id;
 
+    // Dùng .withDeleted() để LEFT JOIN fromAccount / toAccount không lọc mất đối tác đã bị xóa mềm
     const qb = this.transactionRepository
       .createQueryBuilder('transaction')
+      .withDeleted()
       .leftJoinAndSelect('transaction.fromAccount', 'fromAccount')
       .leftJoinAndSelect('transaction.toAccount', 'toAccount');
 
@@ -422,15 +419,25 @@ export class TransactionsService {
                 userId,
                 dto.toAccountNumber,
               );
+            // Bước 1: Kiểm tra trạng thái user (locked)
             this.validateActorAccount(actorAccount);
             const validDest = this.validateDestinationAccountInPhaseB(
               destAccount,
               actorAccount,
             );
-            this.ensureSufficientLockedBalance(
-              actorAccount.balance,
+            // Bước 2: Kiểm tra trạng thái tài khoản (ACTIVE / FROZEN / CLOSED) cho cả nguồn và đích
+            this.ensureAccountActiveInPhaseB(actorAccount, 'source');
+            this.ensureAccountActiveInPhaseB(validDest, 'destination');
+
+            // Bước 3: Kiểm tra hạn mức theo lần và theo ngày (giờ VN) dưới khóa tài khoản nguồn (Bài 5.1)
+            await this.enforceOutgoingLimitsInPhaseB(
+              queryRunner.manager,
+              actorAccount,
               dto.amount,
             );
+
+            // Bước 4: Kiểm tra số dư khả dụng (balance - hold_amount >= amount)
+            this.ensureSufficientAvailableBalance(actorAccount, dto.amount);
 
             const senderBalanceAfter = await this.debitAccount(
               queryRunner.manager,
@@ -476,7 +483,6 @@ export class TransactionsService {
               null,
             );
 
-            // Chuyển dòng khóa sang COMPLETED kèm bản chụp kết quả trong CÙNG transaction với việc chuyển tiền
             await this.idempotencyService.completeInTransaction(
               queryRunner.manager,
               idempotencyRecordId,
@@ -502,13 +508,16 @@ export class TransactionsService {
         transaction: responseSnapshot,
       };
     } catch (phaseBError: any) {
-      const failureCode = this.classifyPhaseBFailure(phaseBError);
+      const { failureCode, customMessage } =
+        this.classifyPhaseBFailure(phaseBError);
       await this.recordFailedTransactionPhaseC(
         initiatedTx.id,
         idempotencyRecordId,
         failureCode,
+        undefined,
+        customMessage,
       );
-      this.throwFailureException(failureCode);
+      this.throwFailureException(failureCode, customMessage);
     }
   }
 
@@ -555,6 +564,7 @@ export class TransactionsService {
               userId,
             );
             this.validateActorAccount(actorAccount);
+            this.ensureAccountActiveInPhaseB(actorAccount, 'destination');
 
             const balanceAfter = await this.creditAccount(
               queryRunner.manager,
@@ -612,13 +622,16 @@ export class TransactionsService {
         transaction: responseSnapshot,
       };
     } catch (phaseBError: any) {
-      const failureCode = this.classifyPhaseBFailure(phaseBError);
+      const { failureCode, customMessage } =
+        this.classifyPhaseBFailure(phaseBError);
       await this.recordFailedTransactionPhaseC(
         initiatedTx.id,
         idempotencyRecordId,
         failureCode,
+        undefined,
+        customMessage,
       );
-      this.throwFailureException(failureCode);
+      this.throwFailureException(failureCode, customMessage);
     }
   }
 
@@ -665,10 +678,15 @@ export class TransactionsService {
               userId,
             );
             this.validateActorAccount(actorAccount);
-            this.ensureSufficientLockedBalance(
-              actorAccount.balance,
+            this.ensureAccountActiveInPhaseB(actorAccount, 'source');
+
+            await this.enforceOutgoingLimitsInPhaseB(
+              queryRunner.manager,
+              actorAccount,
               dto.amount,
             );
+
+            this.ensureSufficientAvailableBalance(actorAccount, dto.amount);
 
             const balanceAfter = await this.debitAccount(
               queryRunner.manager,
@@ -726,13 +744,16 @@ export class TransactionsService {
         transaction: responseSnapshot,
       };
     } catch (phaseBError: any) {
-      const failureCode = this.classifyPhaseBFailure(phaseBError);
+      const { failureCode, customMessage } =
+        this.classifyPhaseBFailure(phaseBError);
       await this.recordFailedTransactionPhaseC(
         initiatedTx.id,
         idempotencyRecordId,
         failureCode,
+        undefined,
+        customMessage,
       );
-      this.throwFailureException(failureCode);
+      this.throwFailureException(failureCode, customMessage);
     }
   }
 
@@ -797,8 +818,10 @@ export class TransactionsService {
               new Set(originalEntries.map((e) => e.account_id)),
             );
 
+            // Dùng .withDeleted() để tải được cả tài khoản đã đóng/xóa mềm và trả đúng mã lỗi CLOSED ở bước dưới
             const lockedAccounts = await queryRunner.manager
               .createQueryBuilder(Account, 'account')
+              .withDeleted()
               .setLock('pessimistic_write', undefined, ['account'])
               .where('account.id IN (:...ids)', { ids: accountIdsToLock })
               .orderBy('account.id', 'ASC')
@@ -807,15 +830,25 @@ export class TransactionsService {
             const accountMap = new Map(lockedAccounts.map((a) => [a.id, a]));
 
             for (const origEntry of originalEntries) {
+              const targetAcc = accountMap.get(origEntry.account_id);
+              if (!targetAcc) {
+                throw new BusinessTransactionError(
+                  TransactionFailureCode.INTERNAL_ERROR,
+                );
+              }
+
               if (origEntry.type === LedgerEntryType.CREDIT) {
-                const targetAcc = accountMap.get(origEntry.account_id);
-                if (!targetAcc) {
-                  throw new BusinessTransactionError(
-                    TransactionFailureCode.INTERNAL_ERROR,
-                  );
-                }
-                this.ensureSufficientLockedBalance(
-                  targetAcc.balance,
+                this.ensureAccountActiveInPhaseB(targetAcc, 'source');
+              } else {
+                this.ensureAccountActiveInPhaseB(targetAcc, 'destination');
+              }
+            }
+
+            for (const origEntry of originalEntries) {
+              if (origEntry.type === LedgerEntryType.CREDIT) {
+                const targetAcc = accountMap.get(origEntry.account_id)!;
+                this.ensureSufficientAvailableBalance(
+                  targetAcc,
                   origEntry.amount,
                   TransactionFailureCode.REVERSAL_INSUFFICIENT_BALANCE,
                 );
@@ -924,13 +957,16 @@ export class TransactionsService {
         throw phaseBError;
       }
 
-      const failureCode = this.classifyPhaseBFailure(phaseBError);
+      const { failureCode, customMessage } =
+        this.classifyPhaseBFailure(phaseBError);
       await this.recordFailedTransactionPhaseC(
         reversalTx.id,
         idempotencyRecordId,
         failureCode,
+        undefined,
+        customMessage,
       );
-      this.throwFailureException(failureCode);
+      this.throwFailureException(failureCode, customMessage);
     }
   }
 
@@ -963,7 +999,6 @@ export class TransactionsService {
       this.validateActorAccount(actorAccount);
       const actorAccountId = actorAccount.id;
 
-      // 1. Đăng ký hoặc kiểm tra khóa Idempotency bằng INSERT ... ON CONFLICT DO NOTHING
       const beginResult = await this.idempotencyService.beginIdempotency(
         queryRunner.manager,
         userId,
@@ -987,13 +1022,12 @@ export class TransactionsService {
         };
       }
 
-      // 2. Nếu là khóa mới: kiểm tra tài khoản đích (404) và chặn tự chuyển (400).
-      // Nếu ném lỗi ở đây, khối catch sẽ rollbackTransaction(), tự động hủy luôn dòng khóa IN_PROGRESS vừa tạo.
       let fromAccountId: string | null = null;
       let toAccountId: string | null = null;
       let destAccountNumber: string | null = null;
 
       if (txType === TransactionType.TRANSFER) {
+        // Mặc định loại trừ tài khoản đã xóa mềm -> chuyển tới tài khoản đã xóa mềm nhận 404 Not Found
         const destAccount = await queryRunner.manager.findOne(Account, {
           where: { account_number: toAccountNumber! },
         });
@@ -1016,7 +1050,6 @@ export class TransactionsService {
         toAccountId = null;
       }
 
-      // 3. Tạo phiếu giao dịch INITIATED -> PROCESSING và gắn transaction_id vào dòng khóa trong cùng transaction
       const createdTx = queryRunner.manager.create(Transaction, {
         actor_account_id: actorAccount.id,
         from_account_id: fromAccountId,
@@ -1085,7 +1118,6 @@ export class TransactionsService {
       this.validateActorAccount(adminAccount);
       const adminAccountId = adminAccount.id;
 
-      // 1. Đăng ký hoặc kiểm tra khóa Idempotency của Admin bằng INSERT ... ON CONFLICT DO NOTHING
       const beginResult = await this.idempotencyService.beginIdempotency(
         queryRunner.manager,
         adminUserId,
@@ -1109,10 +1141,10 @@ export class TransactionsService {
         };
       }
 
-      // 2. Kiểm tra giao dịch gốc (nếu lỗi 404/409 thì rollback sẽ hủy luôn dòng khóa IN_PROGRESS vừa chèn)
       const originalTx = await queryRunner.manager.findOne(Transaction, {
         where: { id: originalTransactionId },
         relations: { fromAccount: true, toAccount: true },
+        withDeleted: true,
       });
 
       if (!originalTx) {
@@ -1181,7 +1213,6 @@ export class TransactionsService {
         await queryRunner.rollbackTransaction();
       }
 
-      // Nếu đụng Partial Unique Index IDX_transactions_active_reversal_original (23505)
       if (error?.code === PG_UNIQUE_VIOLATION) {
         throw new ConflictException(
           'Giao dịch này đã được hoàn tiền hoặc đang có yêu cầu hoàn tiền khác xử lý',
@@ -1199,6 +1230,7 @@ export class TransactionsService {
     idempotencyRecordId: string,
     failureCode: TransactionFailureCode,
     customErrorResponse?: { httpStatus: number; body: Record<string, any> },
+    customMessage?: string,
   ): Promise<void> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
@@ -1218,7 +1250,8 @@ export class TransactionsService {
         FAILURE_CODE_MAP[TransactionFailureCode.INTERNAL_ERROR];
       const responseStatus = customErrorResponse?.httpStatus ?? def.httpStatus;
       const responseBody =
-        customErrorResponse?.body ?? this.buildFailureResponseBody(failureCode);
+        customErrorResponse?.body ??
+        this.buildFailureResponseBody(failureCode, customMessage);
 
       await this.idempotencyService.failInTransaction(
         queryRunner.manager,
@@ -1240,12 +1273,6 @@ export class TransactionsService {
     }
   }
 
-  /**
-   * Xử lý phát lại (Replay) từ dòng bản ghi idempotency_keys:
-   * - COMPLETED: trả về 200 OK kèm đúng bản chụp response_body đã lưu lúc hoàn tất.
-   * - FAILED   : ném lại đúng HttpException từ response_status và response_body đã lưu.
-   * - IN_PROGRESS: trả về 202 Accepted kèm trạng thái hiện tại của giao dịch (dựng từ transaction_id).
-   */
   private async resolveIdempotencyKeyReplay(
     manager: EntityManager,
     record: IdempotencyKey,
@@ -1267,11 +1294,11 @@ export class TransactionsService {
       throw new HttpException(savedBody, savedStatus);
     }
 
-    // Trường hợp IN_PROGRESS: dựng phản hồi 202 Accepted từ giao dịch tương ứng
     if (record.transaction_id) {
       const existingTx = await manager.findOne(Transaction, {
         where: { id: record.transaction_id },
         relations: { fromAccount: true, toAccount: true },
+        withDeleted: true,
       });
 
       if (existingTx) {
@@ -1297,6 +1324,7 @@ export class TransactionsService {
 
   private buildFailureResponseBody(
     failureCode: TransactionFailureCode,
+    customMessage?: string,
   ): Record<string, any> {
     const def =
       FAILURE_CODE_MAP[failureCode] ??
@@ -1311,14 +1339,20 @@ export class TransactionsService {
 
     return {
       statusCode: def.httpStatus,
-      message: def.message,
+      message: customMessage || def.message,
       error: errorLabel,
     };
   }
 
-  private classifyPhaseBFailure(error: any): TransactionFailureCode {
+  private classifyPhaseBFailure(error: any): {
+    failureCode: TransactionFailureCode;
+    customMessage?: string;
+  } {
     if (error instanceof BusinessTransactionError) {
-      return error.failureCode;
+      return {
+        failureCode: error.failureCode,
+        customMessage: error.customMessage,
+      };
     }
 
     if (
@@ -1327,32 +1361,36 @@ export class TransactionsService {
       error?.code === PG_DEADLOCK_DETECTED ||
       error instanceof ServiceUnavailableException
     ) {
-      return TransactionFailureCode.SERVER_BUSY;
+      return { failureCode: TransactionFailureCode.SERVER_BUSY };
     }
 
     if (error?.code === PG_NUMERIC_OVERFLOW) {
-      return TransactionFailureCode.AMOUNT_OVERFLOW;
+      return { failureCode: TransactionFailureCode.AMOUNT_OVERFLOW };
     }
 
     this.logger.error(
       `[PhaseBUnexpectedError] Lỗi bất ngờ trong Pha B: ${error?.message || error}`,
     );
-    return TransactionFailureCode.INTERNAL_ERROR;
+    return { failureCode: TransactionFailureCode.INTERNAL_ERROR };
   }
 
-  private throwFailureException(failureCode: TransactionFailureCode): never {
+  private throwFailureException(
+    failureCode: TransactionFailureCode,
+    customMessage?: string,
+  ): never {
     const def =
       FAILURE_CODE_MAP[failureCode] ??
       FAILURE_CODE_MAP[TransactionFailureCode.INTERNAL_ERROR];
+    const message = customMessage || def.message;
 
     switch (def.httpStatus) {
       case HttpStatus.UNPROCESSABLE_ENTITY:
-        throw new UnprocessableEntityException(def.message);
+        throw new UnprocessableEntityException(message);
       case HttpStatus.SERVICE_UNAVAILABLE:
-        throw new ServiceUnavailableException(def.message);
+        throw new ServiceUnavailableException(message);
       default:
         throw new HttpException(
-          this.buildFailureResponseBody(failureCode),
+          this.buildFailureResponseBody(failureCode, customMessage),
           def.httpStatus,
         );
     }
@@ -1420,30 +1458,88 @@ export class TransactionsService {
   }
 
   private validatePositiveAmount(amount: string): void {
-    if (this.parseDecimalToCents(amount) <= 0n) {
+    if (parseDecimalToCents(amount) <= 0n) {
       throw new BadRequestException('Số tiền giao dịch phải lớn hơn 0');
     }
   }
 
-  private parseDecimalToCents(decimalStr: string): bigint {
-    const trimmed = decimalStr.trim();
-    const isNegative = trimmed.startsWith('-');
-    const normalized = isNegative ? trimmed.slice(1) : trimmed;
-    const [intPart = '0', fracPart = ''] = normalized.split('.');
-    const paddedFrac = (fracPart + '00').slice(0, 2);
-    const cents = BigInt(intPart) * 100n + BigInt(paddedFrac);
-    return isNegative ? -cents : cents;
+  private ensureAccountActiveInPhaseB(
+    account: Account,
+    role: 'source' | 'destination',
+  ): void {
+    if (account.status === AccountStatus.ACTIVE) {
+      return;
+    }
+
+    if (role === 'source') {
+      if (account.status === AccountStatus.FROZEN) {
+        throw new BusinessTransactionError(
+          TransactionFailureCode.SOURCE_ACCOUNT_FROZEN,
+        );
+      }
+      throw new BusinessTransactionError(
+        TransactionFailureCode.SOURCE_ACCOUNT_CLOSED,
+      );
+    }
+
+    if (account.status === AccountStatus.FROZEN) {
+      throw new BusinessTransactionError(
+        TransactionFailureCode.DESTINATION_ACCOUNT_FROZEN,
+      );
+    }
+    throw new BusinessTransactionError(
+      TransactionFailureCode.DESTINATION_ACCOUNT_CLOSED,
+    );
   }
 
-  private ensureSufficientLockedBalance(
-    lockedBalance: string,
+  private async enforceOutgoingLimitsInPhaseB(
+    manager: EntityManager,
+    sourceAccount: Pick<Account, 'id' | 'tier'>,
+    requiredAmount: string,
+  ): Promise<void> {
+    const limits = await calculateAccountLimits(
+      manager,
+      sourceAccount.id,
+      sourceAccount.tier,
+    );
+
+    const amountCents = parseDecimalToCents(requiredAmount);
+    const perTxCents = parseDecimalToCents(limits.perTransaction);
+    const perDayCents = parseDecimalToCents(limits.perDay);
+    const usedTodayCents = parseDecimalToCents(limits.usedToday);
+
+    if (amountCents > perTxCents) {
+      const msg =
+        `Số tiền vượt quá hạn mức mỗi giao dịch của tài khoản ${sourceAccount.tier} ` +
+        `(${formatVndCurrency(limits.perTransaction)}). ` +
+        `Hạn mức trong ngày còn lại hôm nay: ${formatVndCurrency(limits.remainingToday)}.`;
+      throw new BusinessTransactionError(
+        TransactionFailureCode.LIMIT_PER_TRANSACTION_EXCEEDED,
+        msg,
+      );
+    }
+
+    if (usedTodayCents + amountCents > perDayCents) {
+      const msg =
+        `Số tiền vượt quá hạn mức giao dịch trong ngày của tài khoản ${sourceAccount.tier} ` +
+        `(${formatVndCurrency(limits.perDay)}/ngày). ` +
+        `Hạn mức còn lại hôm nay: ${formatVndCurrency(limits.remainingToday)}.`;
+      throw new BusinessTransactionError(
+        TransactionFailureCode.LIMIT_PER_DAY_EXCEEDED,
+        msg,
+      );
+    }
+  }
+
+  private ensureSufficientAvailableBalance(
+    lockedAccount: Pick<Account, 'balance' | 'hold_amount'>,
     requiredAmount: string,
     failureCode: TransactionFailureCode = TransactionFailureCode.INSUFFICIENT_BALANCE,
   ): void {
-    if (
-      this.parseDecimalToCents(lockedBalance) <
-      this.parseDecimalToCents(requiredAmount)
-    ) {
+    const availableCents =
+      parseDecimalToCents(lockedAccount.balance) -
+      parseDecimalToCents(lockedAccount.hold_amount ?? '0.00');
+    if (availableCents < parseDecimalToCents(requiredAmount)) {
       throw new BusinessTransactionError(failureCode);
     }
   }
@@ -1511,7 +1607,14 @@ export class TransactionsService {
       .createQueryBuilder()
       .update(Account)
       .set({ balance: () => 'balance - :amount' })
-      .where('id = :id AND balance >= :amount', { id: accountId, amount })
+      .where(
+        'id = :id AND status = :activeStatus AND deleted_at IS NULL AND (balance - hold_amount) >= :amount',
+        {
+          id: accountId,
+          activeStatus: AccountStatus.ACTIVE,
+          amount,
+        },
+      )
       .returning('balance')
       .execute();
 
@@ -1532,7 +1635,11 @@ export class TransactionsService {
         .createQueryBuilder()
         .update(Account)
         .set({ balance: () => 'balance + :amount' })
-        .where('id = :id', { id: accountId, amount })
+        .where('id = :id AND status = :activeStatus AND deleted_at IS NULL', {
+          id: accountId,
+          activeStatus: AccountStatus.ACTIVE,
+          amount,
+        })
         .returning('balance')
         .execute();
 

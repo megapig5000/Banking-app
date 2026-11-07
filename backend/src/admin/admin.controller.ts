@@ -2,12 +2,15 @@ import {
   Controller,
   Get,
   Patch,
+  Delete,
   Param,
   Body,
   Query,
   UseGuards,
   Request,
   ParseUUIDPipe,
+  HttpCode,
+  HttpStatus,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -19,8 +22,10 @@ import {
 import { AdminService } from './admin.service';
 import { AdminUsersQueryDto } from './dto/admin-users-query.dto';
 import { UpdateUserStatusDto } from './dto/update-user-status.dto';
+import { UpdateAccountAdminDto } from './dto/update-account-admin.dto';
 import { AdminTransactionsQueryDto } from './dto/admin-transactions-query.dto';
 import { AdminAuditLogsQueryDto } from './dto/admin-audit-logs-query.dto';
+import { ProfileHistoryQueryDto } from '../users/dto/profile-history-query.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -37,7 +42,7 @@ export class AdminController {
   @Get('users')
   @ApiOperation({
     summary:
-      'Lấy danh sách người dùng kèm số tài khoản (Chỉ ADMIN, có phân trang & lọc theo status/role)',
+      'Lấy danh sách người dùng kèm thông tin tài khoản (Chỉ ADMIN, có phân trang, lọc status/role & hỗ trợ includeDeleted)',
   })
   @ApiResponse({
     status: 200,
@@ -58,6 +63,33 @@ export class AdminController {
   })
   async getUsers(@Query() query: AdminUsersQueryDto) {
     return this.adminService.getUsers(query);
+  }
+
+  @Get('users/:id/profile-history')
+  @ApiOperation({
+    summary:
+      'Xem lịch sử các phiên bản hồ sơ cũ của một người dùng bất kỳ (Chỉ ADMIN, có phân trang, mới nhất trước)',
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'UUID của người dùng cần tra cứu lịch sử hồ sơ',
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Trả về danh sách các phiên bản hồ sơ cũ (version, fullName, email, phone, changedByUserId, changedAt) và meta phân trang',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Chưa đăng nhập hoặc token không hợp lệ',
+  })
+  @ApiResponse({ status: 403, description: 'Không có quyền ADMIN' })
+  @ApiResponse({ status: 404, description: 'Không tìm thấy người dùng' })
+  async getUserProfileHistory(
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Query() query: ProfileHistoryQueryDto,
+  ) {
+    return this.adminService.getUserProfileHistory(id, query);
   }
 
   @Patch('users/:id/status')
@@ -89,6 +121,94 @@ export class AdminController {
     @Body() dto: UpdateUserStatusDto,
   ) {
     return this.adminService.updateUserStatus(req.user.id, id, dto);
+  }
+
+  @Delete('users/:id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary:
+      'Xóa mềm người dùng CUSTOMER và đóng tài khoản ngân hàng (Chỉ ADMIN, yêu cầu số dư = 0, hold = 0, không có giao dịch đang dở)',
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'UUID của người dùng cần xóa mềm',
+  })
+  @ApiResponse({
+    status: 204,
+    description:
+      'Xóa mềm thành công (tài khoản chuyển sang CLOSED, đặt deleted_at cho cả account & user, ghi Audit USER_SOFT_DELETED, thu hồi phiên tức thì)',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'UUID không hợp lệ hoặc Admin tự xóa chính mình',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Chưa đăng nhập hoặc token không hợp lệ',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Không có quyền ADMIN hoặc cố tình xóa tài khoản ADMIN khác',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Không tìm thấy người dùng hoặc người dùng đã bị xóa mềm',
+  })
+  @ApiResponse({
+    status: 409,
+    description:
+      'Không thể xóa do tài khoản vẫn còn số dư > 0, còn tiền phong tỏa (holdAmount > 0), hoặc đang có giao dịch xử lý dở dang',
+  })
+  async softDeleteUser(
+    @Request() req: any,
+    @Param('id', new ParseUUIDPipe()) id: string,
+  ): Promise<void> {
+    await this.adminService.softDeleteUser(req.user.id, id);
+  }
+
+  @Patch('accounts/:accountNumber')
+  @ApiOperation({
+    summary:
+      'Quản lý trạng thái tài khoản (ACTIVE/FROZEN/CLOSED), hạng tài khoản (STANDARD/VIP) và số tiền giữ chỗ holdAmount (Chỉ ADMIN, tự động ghi Audit Log ACCOUNT_UPDATED)',
+  })
+  @ApiParam({
+    name: 'accountNumber',
+    example: '1000000001',
+    description: 'Số tài khoản ngân hàng cần cập nhật',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Cập nhật thông tin tài khoản thành công',
+  })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Dữ liệu đầu vào không hợp lệ hoặc không có trường nào được gửi',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Chưa đăng nhập hoặc token không hợp lệ',
+  })
+  @ApiResponse({ status: 403, description: 'Không có quyền ADMIN' })
+  @ApiResponse({
+    status: 404,
+    description: 'Không tìm thấy tài khoản ngân hàng',
+  })
+  @ApiResponse({
+    status: 409,
+    description:
+      'Vi phạm quy tắc chuyển trạng thái (đổi trạng thái từ CLOSED, hoặc đóng tài khoản khi còn số dư / còn hold / còn giao dịch đang xử lý)',
+  })
+  @ApiResponse({
+    status: 422,
+    description:
+      'Số tiền phong tỏa (holdAmount) vượt quá số dư hiện tại của tài khoản',
+  })
+  async updateAccount(
+    @Param('accountNumber') accountNumber: string,
+    @Body() dto: UpdateAccountAdminDto,
+  ) {
+    return this.adminService.updateAccount(accountNumber, dto);
   }
 
   @Get('transactions')

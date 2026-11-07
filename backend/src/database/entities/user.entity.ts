@@ -3,6 +3,7 @@ import {
   PrimaryGeneratedColumn,
   Column,
   CreateDateColumn,
+  DeleteDateColumn,
   OneToMany,
 } from 'typeorm';
 import { Account } from './account.entity';
@@ -28,6 +29,12 @@ export class User {
   @Column({ type: 'varchar', unique: true })
   email: string;
 
+  @Column({ type: 'varchar', length: 20, nullable: true })
+  phone: string | null;
+
+  @Column({ name: 'profile_version', type: 'integer', default: 1 })
+  profile_version: number;
+
   @Column({ type: 'varchar' })
   password_hash: string;
 
@@ -39,6 +46,9 @@ export class User {
 
   @CreateDateColumn({ type: 'timestamptz' })
   created_at: Date;
+
+  @DeleteDateColumn({ name: 'deleted_at', type: 'timestamptz', nullable: true })
+  deleted_at: Date | null;
 
   @OneToMany(() => Account, (account) => account.user)
   accounts: Account[];

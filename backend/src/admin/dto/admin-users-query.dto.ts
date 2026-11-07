@@ -1,5 +1,12 @@
-import { IsOptional, IsInt, Min, Max, IsEnum } from 'class-validator';
-import { Type } from 'class-transformer';
+import {
+  IsOptional,
+  IsInt,
+  Min,
+  Max,
+  IsEnum,
+  IsBoolean,
+} from 'class-validator';
+import { Transform, Type } from 'class-transformer';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { UserRole, UserStatus } from '../../database/entities/user.entity';
 import { SortOrder } from '../../transactions/dto/transaction-query.dto';
@@ -44,6 +51,21 @@ export class AdminUsersQueryDto {
   @IsOptional()
   @IsEnum(UserRole)
   role?: UserRole;
+
+  @ApiPropertyOptional({
+    type: Boolean,
+    default: false,
+    description:
+      'Nếu đặt true, kết quả bao gồm cả người dùng và tài khoản đã bị xóa mềm (kèm deletedAt)',
+  })
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (value === true || value === 'true' || value === '1') return true;
+    if (value === false || value === 'false' || value === '0') return false;
+    return value;
+  })
+  @IsBoolean()
+  includeDeleted?: boolean = false;
 
   @ApiPropertyOptional({
     enum: SortOrder,
