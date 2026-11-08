@@ -1,23 +1,57 @@
-# Simple Banking App — Web Desktop
+# Simple Banking App — Web Desktop (Fullstack NodeJS + ReactJS)
 
-Ứng dụng ngân hàng trực tuyến chạy trên trình duyệt desktop, cho phép người dùng quản lý tài khoản, nạp/rút tiền, chuyển khoản nội bộ an toàn, tra cứu lịch sử giao dịch, cập nhật hồ sơ cá nhân kèm lịch sử phiên bản (`account_history`), và hỗ trợ quản trị viên (`ADMIN`) quản lý người dùng (khóa/mở khóa, xóa mềm), quản lý tài khoản (`ACTIVE`/`FROZEN`/`CLOSED`, hạng `STANDARD`/`VIP`, phong tỏa số dư `holdAmount`), giám sát giao dịch toàn hệ thống, xem nhật ký kiểm toán và thực hiện hoàn tiền (`REVERSAL`). Dự án tuân thủ nguyên tắc K.I.S.S, đảm bảo tính toàn vẹn dữ liệu và bảo mật bằng Database Transaction, Pessimistic Locking (`SELECT ... FOR UPDATE`), chống Deadlock, bảng **`idempotency_keys`** (lưu mã băm SHA-256, bản chụp kết quả và hạn dùng 24h) kết hợp **Auto-Retry an toàn phía Frontend**, **Sổ cái kép chỉ-ghi-thêm (`ledger_entries`)**, **Vòng đời giao dịch (State Machine 3 Pha)**, **Phân quyền RBAC (`CUSTOMER` / `ADMIN`)**, **Nhật ký kiểm toán tự động chỉ-ghi-thêm (`audit_logs`)**, **Hạn mức giao dịch theo lần & ngày Việt Nam**, **Số dư khả dụng (`balance − hold_amount`)** và **Xóa mềm (`Soft Delete`)**.
+Ứng dụng ngân hàng trực tuyến chạy trên trình duyệt desktop, cho phép người dùng quản lý tài khoản, nạp/rút tiền, chuyển khoản nội bộ an toàn, tra cứu lịch sử giao dịch, cập nhật hồ sơ cá nhân kèm lịch sử phiên bản (`account_history`), và hỗ trợ quản trị viên (`ADMIN`) quản lý người dùng (khóa/mở khóa, xóa mềm), quản lý tài khoản (`ACTIVE`/`FROZEN`/`CLOSED`, hạng `STANDARD`/`VIP`, phong tỏa số dư `holdAmount`), giám sát giao dịch toàn hệ thống, xem nhật ký kiểm toán và thực hiện hoàn tiền (`REVERSAL`).
 
-## 1. Overview & Tech Stack
-- **Backend:** NestJS, TypeScript, TypeORM (Migrations & Entity Subscribers), PostgreSQL, `@nestjs/schedule` (Cron quét giao dịch treo & dọn khóa Idempotency hết hạn), Node.js `AsyncLocalStorage`, Passport JWT, Bcrypt, Class-Validator, Swagger.
-- **Frontend:** Next.js (App Router — Client Components), ReactJS, Zustand, Tailwind CSS, Axios (kèm cơ chế Idempotent Auto-Retry & `useRef` In-Flight Guard).
-- **Infrastructure & Testing:** Docker, Docker Compose, Jest & Supertest (8 bộ E2E Test Suites với 66 bài kiểm thử tích hợp trên DB test tách biệt).
+Dự án tuân thủ nghiêm ngặt nguyên tắc **K.I.S.S**, đảm bảo tính toàn vẹn dữ liệu và bảo mật bằng Database Transaction, Pessimistic Locking (`SELECT ... FOR UPDATE`), chống Deadlock, bảng **`idempotency_keys`** (lưu mã băm SHA-256, bản chụp kết quả và hạn dùng 24h) kết hợp **Auto-Retry an toàn phía Frontend**, **Sổ cái kép chỉ-ghi-thêm (`ledger_entries`)**, **Vòng đời giao dịch (State Machine 3 Pha)**, **Phân quyền RBAC (`CUSTOMER` / `ADMIN`)**, **Nhật ký kiểm toán tự động chỉ-ghi-thêm (`audit_logs`)**, **Hạn mức giao dịch theo lần & ngày Việt Nam**, **Số dư khả dụng (`balance − hold_amount`)**, **Xóa mềm (`Soft Delete`)**, cùng **Kim tự tháp Kiểm thử (Unit Tests đạt độ phủ ~96.8% + 65 bài E2E Integration Tests + GitHub Actions CI)**.
 
-## 2. Architecture
-Hệ thống phân tầng rõ ràng theo kiến trúc module của NestJS: `Middleware (AsyncLocalStorage) -> Guard (JwtAuthGuard, RolesGuard) -> Interceptor (AuditInterceptor) -> Controller -> Service -> TypeORM Repository / EntityManager / Subscriber -> PostgreSQL`.
-- Sơ đồ tuần tự (Auth + Login Audit, Luồng giao dịch 3 Pha kèm kiểm tra Trạng thái/Hạn mức/Khả dụng & Idempotency Snapshot, Hoàn tiền `REVERSAL`, Khóa/Mở khóa User, và Xóa mềm User + Đóng tài khoản): xem tại [`docs/sequence_diagrams.md`](docs/sequence_diagrams.md).
-- Ghi chép quyết định kiến trúc (ADR-001 → ADR-018): xem tại [`docs/ADR.md`](docs/ADR.md).
+---
+
+## Mục lục
+1. [Overview & Tech Stack (Kèm Danh sách Phiên bản)](#1-overview--tech-stack-kèm-danh-sách-phiên-bản)
+2. [Architecture & Tài liệu Kỹ thuật](#2-architecture--tài-liệu-kỹ-thuật)
+3. [Environment Variables](#3-environment-variables)
+4. [Chạy dự án bằng Docker (1 Lệnh duy nhất)](#4-chạy-dự-án-bằng-docker-1-lệnh-duy-nhất)
+5. [Local Development & Quản lý Migration](#5-local-development--quản-lý-migration)
+6. [Kiểm thử Tự động (Unit Tests, Coverage >= 80%, 65 E2E Tests & CI)](#6-kiểm-thử-tự-động-unit-tests-coverage--80-65-e2e-tests--ci)
+7. [Concurrency, Locking & Deadlock (Module 1)](#7-concurrency-locking--deadlock-module-1)
+8. [Sổ cái kép — Double-entry Ledger (Module 3A)](#8-sổ-cái-kép--double-entry-ledger-module-3a)
+9. [Vòng đời giao dịch (State Machine) & Hoàn tiền (`REVERSAL` — Module 3B)](#9-vòng-đời-giao-dịch-state-machine--hoàn-tiền-reversal--module-3b)
+10. [Chống Trùng Lặp Giao Dịch (`idempotency_keys`) & Frontend Auto-Retry (Module 2)](#10-chống-trùng-lặp-giao-dịch-idempotency_keys--frontend-auto-retry-module-2)
+11. [Phân quyền theo Vai trò (RBAC) & Admin API (Module 4A)](#11-phân-quyền-theo-vai-trò-rbac--admin-api-module-4a)
+12. [Nhật ký Kiểm toán Tự động (`audit_logs` — Module 4A)](#12-nhật-ký-kiểm-toán-tự-động-audit_logs--module-4a)
+13. [Hạn mức, Trạng thái tài khoản & Số dư khả dụng (Module 5 — Bài 5.1 & 5.2)](#13-hạn-mức-trạng-thái-tài-khoản--số-dư-khả-dụng-module-5--bài-51--52)
+14. [Xóa mềm (`Soft Delete`) & Lịch sử phiên bản hồ sơ (`account_history` — Bài 3.4)](#14-xóa-mềm-soft-delete--lịch-sử-phiên-bản-hồ-sơ-account_history--bài-34)
+15. [Seed Data & Tài khoản Demo](#15-seed-data--tài-khoản-demo)
+16. [Danh mục API Endpoints](#16-danh-mục-api-endpoints)
+17. [Demo Scenario Tổng hợp](#17-demo-scenario-tổng-hợp)
+18. [Troubleshooting & Known Limitations](#18-troubleshooting--known-limitations)
+19. [Ma trận Trạng thái các Module Bổ sung (`ĐÃ LÀM` & `HOÃN`)](#19-ma-trận-trạng-thái-các-module-bổ-sung-đã-làm--hoãn)
+
+---
+
+## 1. Overview & Tech Stack (Kèm Danh sách Phiên bản)
+- **Runtime & Database:** Node.js `20-alpine` (Docker), PostgreSQL `15-alpine`.
+- **Backend (`backend/package.json`):** NestJS `^12.0.1`, TypeScript `^6.0.2`, TypeORM `^1.1.1` (Migrations & Entity Subscribers), `pg` `^8.23.1`, `@nestjs/schedule` `^12.0.2`, `@nestjs/jwt` `^12.0.2`, `passport-jwt` `^4.0.1`, `bcrypt` `^6.0.0`, `class-validator` `^0.15.1`, `class-transformer` `^0.5.1`, `@nestjs/swagger` `^12.0.2`, Node.js `AsyncLocalStorage`.
+- **Frontend (`frontend/package.json`):** Next.js (App Router — Client Components), ReactJS, Zustand, Tailwind CSS, Axios (kèm Idempotent Auto-Retry & `useRef` In-Flight Guard).
+- **Testing & CI:** Jest `^30.0.0`, `ts-jest` `^29.4.0`, Supertest `^7.0.0`, `oxlint` `^1.58.0`, GitHub Actions CI (`.github/workflows/ci.yml`).
+
+## 2. Architecture & Tài liệu Kỹ thuật
+Hệ thống phân tầng rõ ràng theo kiến trúc module của NestJS:
+`Middleware (AsyncLocalStorage) -> Guard (JwtAuthGuard, RolesGuard) -> Interceptor (AuditInterceptor) -> Controller -> Service -> TypeORM Repository / EntityManager / Subscriber -> PostgreSQL`.
+
+Bộ tài liệu kỹ thuật đi kèm trong thư mục `docs/`:
+- [`docs/ADR.md`](docs/ADR.md) — **18 Bản ghi Quyết định Kiến trúc (`ADR-001` → `ADR-018`)** (mỗi ADR đều có đủ Context, Decision, Reason, Trade-offs).
+- [`docs/sequence_diagrams.md`](docs/sequence_diagrams.md) — **5 Sơ đồ Tuần tự (Mermaid):** Đăng nhập + Audit, Giao dịch 3 Pha (Trạng thái/Hạn mức/Khả dụng/Sổ cái/Idempotency), Hoàn tiền `REVERSAL`, Khóa/Mở khóa User, và Xóa mềm User + Đóng tài khoản.
+- [`docs/testing.md`](docs/testing.md) — **Chiến lược & Quy ước Kiểm thử:** Kim tự tháp kiểm thử (Unit Test vs E2E Test), quy ước AAA, cách đọc bảng độ phủ.
+- [`docs/traceability.md`](docs/traceability.md) — **Ma trận Đối chiếu Yêu cầu:** Truy vết toàn bộ yêu cầu Đề bài gốc và 23 bài tập bổ sung tới từng file code và mã bài test.
+- [`docs/defense-qa.md`](docs/defense-qa.md) — **Cẩm nang 40 Câu hỏi & Trả lời Bảo vệ Đồ án** (30 câu theo 5 chủ đề + 10 câu "Tình huống khó").
 - Báo cáo thực nghiệm Concurrency & Locking (Module 1):
   - [`docs/concurrency/1.1-race-condition.md`](docs/concurrency/1.1-race-condition.md) — Tái hiện lỗi Race Condition (Lost Update).
   - [`docs/concurrency/1.3-lock-comparison.md`](docs/concurrency/1.3-lock-comparison.md) — Benchmark so sánh Pessimistic Locking và Optimistic Locking.
   - [`docs/concurrency/1.4-deadlock.md`](docs/concurrency/1.4-deadlock.md) — Phòng ngừa & Xử lý Deadlock khi chuyển khoản hai chiều A↔B.
 
 ## 3. Environment Variables
-Sao chép file môi trường mẫu trước khi chạy:
+Sao chép các file biến môi trường mẫu trước khi chạy (chỉ chứa giá trị giả dành cho phát triển/kiểm thử):
 ```bash
 # Cho Docker Compose ở thư mục gốc
 cp .env.example .env
@@ -27,14 +61,25 @@ cp backend/.env.example backend/.env
 cp backend/.env.test.example backend/.env.test
 ```
 
-## 4. Chạy dự án bằng Docker (Khuyên dùng)
-Chỉ cần một lệnh duy nhất từ thư mục gốc:
+| Biến môi trường | Giá trị mặc định (`.env.example`) | Ý nghĩa |
+| :--- | :--- | :--- |
+| `DB_HOST` / `DB_PORT` | `postgres` (Docker) / `localhost` (`5432` dev, `5433` test) | Địa chỉ và cổng kết nối PostgreSQL |
+| `DB_USER` / `DB_PASSWORD` | `root` / `password` | Thông tin đăng nhập PostgreSQL |
+| `DB_NAME` | `simple_bank` (dev) / `simple_bank_test` (test) | Tên cơ sở dữ liệu (E2E test bắt buộc đuôi `_test`) |
+| `JWT_SECRET` / `JWT_EXPIRES_IN` | `super_secret_jwt_key_for_development` / `1h` | Khóa bí mật ký JWT và thời hạn sống của Access Token |
+| `PORT` / `CORS_ORIGIN` | `3000` / `http://localhost:3001` | Cổng Backend API và Origin được phép trong CORS whitelist |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:3000/api` | Địa chỉ Backend API dùng cho Frontend Next.js |
+| `SEED_ON_START` | `true` (dev) / `false` (test) | Tự động chạy script seed dữ liệu mẫu khi container backend khởi động |
+
+## 4. Chạy dự án bằng Docker (1 Lệnh duy nhất)
+Từ một bản clone sạch, chỉ cần tạo `.env` và chạy một lệnh duy nhất tại thư mục gốc:
 ```bash
+cp .env.example .env
 docker compose up --build
 ```
-Khi khởi động, container `backend` sẽ tự động thực hiện tuần tự:
-1. Chạy TypeORM Migrations (`npm run migration:run:prod` — tạo bảng, backfill sổ cái, gắn trigger bất biến cho `ledger_entries`, `audit_logs`, `account_history`, nâng cấp schema State Machine / Reversal, tạo bảng `idempotency_keys`, chuẩn hóa enum `users.role` và bổ sung cột hạn mức / trạng thái tài khoản / xóa mềm).
-2. Chạy Seed dữ liệu mẫu nếu `SEED_ON_START=true` (tạo 1 `ADMIN`, 3 `CUSTOMER` với hạng `STANDARD` / `VIP`, giao dịch mẫu và đồng bộ bút toán sổ cái mà không sinh bản ghi audit rác).
+Khi khởi động, container `backend` (sau khi chờ `postgres` đạt trạng thái `healthy`) sẽ tự động thực hiện tuần tự qua `start.sh`:
+1. Chạy toàn bộ 7 TypeORM Migrations (`npm run migration:run:prod`).
+2. Chạy Seed dữ liệu mẫu (`node dist/database/seed.js`) nếu `SEED_ON_START=true`.
 3. Khởi động NestJS API server ở cổng `3000`.
 
 Các địa chỉ truy cập:
@@ -43,12 +88,11 @@ Các địa chỉ truy cập:
 - **Swagger Docs:** http://localhost:3000/api/docs
 
 ## 5. Local Development & Quản lý Migration
-Nếu muốn chạy Backend và Frontend trực tiếp trên máy host:
 ```bash
 # 1. Khởi chạy PostgreSQL cho môi trường dev (cổng 5432)
 docker compose up -d postgres
 
-# 2. Chạy Migration & Seed tại thư mục backend
+# 2. Chạy Migration, Seed & Start Dev tại thư mục backend
 cd backend
 npm install
 npm run migration:run
@@ -66,37 +110,54 @@ Các lệnh quản lý schema với TypeORM Migration (trong thư mục `backend
 - Hoàn tác (rollback) 1 migration gần nhất: `npm run migration:revert`
 - Sinh migration mới khi sửa Entity: `npm run migration:generate -- src/database/migrations/<TenMigration>`
 
-## 6. Chạy Kiểm thử Tự động (66 E2E Tests trên DB Test riêng)
+## 6. Kiểm thử Tự động (Unit Tests, Coverage >= 80%, 65 E2E Tests & CI)
+
+Chi tiết chiến lược kiểm thử xem tại [`docs/testing.md`](docs/testing.md).
+
+### 6.1. Chạy Unit Tests & Báo cáo Độ phủ mã (Không cần bật Docker/DB)
+Bộ **9 Unit Test Suites (hơn 145 bài Unit Tests)** đặt cạnh mã nguồn (`backend/src/**/*.spec.ts`) kiểm thử toàn bộ logic nghiệp vụ với Mock trong **~2 giây**:
+```bash
+cd backend
+
+# Chạy nhanh toàn bộ Unit Tests
+npm run test:unit
+
+# Chạy Unit Tests kèm kiểm tra ngưỡng ép độ phủ (coverageThreshold)
+npm run test:cov
+```
+Ngưỡng độ phủ được ép cứng bằng `coverageThreshold` trong `backend/jest.config.ts` (dưới ngưỡng thì lệnh thất bại):
+- **`./src/accounts/`:** Ép `≥ 80%` (Thực tế đạt **`100%`** trên cả 4 chỉ số).
+- **`./src/transactions/`:** Ép `≥ 80%` (Thực tế đạt **`~96.1%` Statements, `~90.2%` Branches, `100%` Functions, `~96.3%` Lines**).
+- **Toàn dự án (`global`):** Ép `≥ 75%` (Thực tế đạt **`~96.8%` Statements, `~91.4%` Branches, `~98.9%` Functions, `~96.9%` Lines**).
+
+### 6.2. Chạy 8 Bộ E2E Integration Tests (65 bài kiểm thử) trên DB Test riêng
 Dự án bố trí container `postgres-test` chạy riêng ở cổng `5433` (sử dụng `tmpfs` trên RAM) để việc chạy test **không bao giờ chạm vào dữ liệu dev**:
 ```bash
 # 1. Bật container database test (cổng 5433)
 docker compose --profile test up -d postgres-test
 
-# 2. Tạo file .env.test (nếu chưa có) và chạy toàn bộ E2E Test
+# 2. Tạo file .env.test (nếu chưa có) và chạy toàn bộ 65 bài E2E Tests
 cd backend
 cp .env.test.example .env.test
 npm run test:e2e
 ```
-Bộ test bao gồm 8 test suites (66 bài kiểm thử tích hợp):
-- `test/app.e2e-spec.ts` (1 test): Smoke test luồng Đăng ký → Đăng nhập → Xem số dư → Nạp tiền (`DEPOSIT` / `COMPLETED`).
-- `test/concurrency.e2e-spec.ts` (3 tests — Bài 7.2 + Kiểm tra bất biến Q1′–Q5):
-  - **T1:** 20 request rút `100,000đ` đồng thời trên số dư `1,000,000đ` (5 vòng) → luôn đúng `10 × 201 COMPLETED`, `10 × 422 FAILED`, số dư `0.00`.
-  - **T2:** Chuyển khoản hai chiều A→B và B→A đồng thời (5 vòng) → không deadlock/500, bảo toàn tổng số dư `A + B`.
-  - **T3:** 5 request đồng thời dùng chung 1 `Idempotency-Key` (5 vòng) → tất cả phản hồi trong `{201, 200, 202}`, chỉ tạo đúng 1 giao dịch `COMPLETED` và 2 bút toán trong DB.
-- `test/ledger.e2e-spec.ts` (5 tests — Bài 3.1 & Bài 7.3):
-  - **L1 – L3, R1 – R2:** Chặn `UPDATE`/`DELETE` trên `ledger_entries`; khớp số dư với tổng bút toán; kiểm tra rollback Pha B không để lại bút toán mồ côi.
-- `test/state-machine-reversal.e2e-spec.ts` (10 tests — Bài 3.2 & Bài 5.3):
-  - **ST, ST2, F1, F2, P1, P2, V1 – V4:** Duyệt 36 cặp chuyển trạng thái; ghi nhận `FAILED`; quét giao dịch treo `sweepStuckTransactions()`; hoàn tiền `REVERSAL` và chống hoàn tiền hai lần.
-- `test/idempotency.e2e-spec.ts` (10 tests — Bài 2.1):
-  - **I1 – I10:** Kiểm chứng gửi lặp 5 lần tuần tự, trùng khóa khác nội dung (`409`), 5 request đồng thời cùng khóa, replay lỗi `FAILED`, khóa hết hạn, dọn dẹp `deleteExpiredKeys()`, cô lập khóa theo `user_id`, và bảo toàn bản chụp `COMPLETED`.
-- `test/rbac-admin-audit.e2e-spec.ts` (14 tests — Bài 3.3 & Bài 4.1):
-  - **RB1 – RB4, AD1 – AD4, AU1 – AU6:** Kiểm chứng ma trận quyền RBAC, hiệu lực tức thì khi đổi role/khóa user, các API `/api/admin/*`, Subscriber/Interceptor ghi `audit_logs` cùng transaction và bất biến Q6–Q7.
-- `test/limits-account-status.e2e-spec.ts` (13 tests — Bài 5.1 & Bài 5.2):
-  - **L1 – L7:** Kiểm chứng hạn mức mỗi lần (`30.000.000,01đ` bị từ chối `LIMIT_PER_TRANSACTION_EXCEEDED`), hạn mức lũy kế ngày (`5 × 9.9M` thành công, lần 6 bị từ chối `LIMIT_PER_DAY_EXCEEDED` dù nhỏ, đúng `500.000đ` còn lại thành công), nâng hạng `VIP` có hiệu lực ngay, biên múi giờ Việt Nam (`23:59` hôm qua vs `00:01` hôm nay), 10 giao dịch đồng thời không vượt hạn mức ngày, miễn hạn mức cho `DEPOSIT`/`REVERSAL`, và khối `limits` trên `/api/accounts/me`.
-  - **A1 – A6:** Kiểm chứng 4 mã lỗi trạng thái tài khoản (`SOURCE_ACCOUNT_FROZEN`, `SOURCE_ACCOUNT_CLOSED`, `DESTINATION_ACCOUNT_FROZEN`, `DESTINATION_ACCOUNT_CLOSED`) đều ghi nhận `FAILED`, luật đóng tài khoản `CLOSED`, số dư khả dụng (`balance − hold_amount`) và tranh chấp đồng thời giữa đặt hold với rút tiền, 3 ràng buộc `CHECK` mức DB, Audit `ACCOUNT_UPDATED`, và hoàn tiền khi tài khoản bị đóng băng.
-- `test/soft-delete-profile-history.e2e-spec.ts` (10 tests — Bài 3.4):
-  - **S1 – S5:** Kiểm chứng xóa mềm người dùng có số dư `0` (`DELETE /api/admin/users/:id` → `204`), thu hồi phiên `401` tức thì trên cả token cũ, ẩn khỏi danh sách mặc định và hiện khi `includeDeleted=true`, giữ nguyên `counterpartyAccountNumber` trong lịch sử của đối tác, giữ chỗ email đã xóa (`409`), và rollback nguyên tử cùng Audit `USER_SOFT_DELETED`.
-  - **H1 – H5:** Kiểm chứng đổi số điện thoại 2 lần lưu 2 bản chụp cũ vào `account_history` theo đúng `version`, đổi email yêu cầu `currentPassword` (sai trả `400`), rollback nguyên tử khi lỗi giữa chừng, phân quyền xem lịch sử hồ sơ, chặn sửa/xóa `account_history` bằng Trigger, và bất biến Q8–Q10.
+Danh sách 8 bộ E2E Test Suites (65 tests):
+1. `test/app.e2e-spec.ts` (1 test): Smoke test Đăng ký → Đăng nhập → Xem số dư → Nạp tiền.
+2. `test/concurrency.e2e-spec.ts` (3 tests — Bài 7.2): `T1` (20 rút đồng thời × 5 vòng), `T2` (chuyển khoản hai chiều A↔B × 5 vòng), `T3` (5 request đồng thời cùng `Idempotency-Key` × 5 vòng).
+3. `test/ledger.e2e-spec.ts` (5 tests — Bài 3.1 & 7.3): `L1–L3` (bất biến sổ cái kép) và `R1–R2` (rollback khi lỗi giữa chừng ở Pha B không để lại bút toán mồ côi).
+4. `test/state-machine-reversal.e2e-spec.ts` (10 tests — Bài 3.2 & 5.3): `ST, ST2` (36 cặp chuyển trạng thái), `F1–F2` (ghi nhận `FAILED`), `P1–P2` (`202` & quét giao dịch treo), `V1–V4` (hoàn tiền `REVERSAL` & chống hoàn tiền 2 lần).
+5. `test/idempotency.e2e-spec.ts` (10 tests — Bài 2.1): `I1–I10` (replay tuần tự, trùng khóa khác nội dung `409`, đồng thời cùng khóa, replay `FAILED`, khóa hết hạn, dọn khóa, cô lập theo user, bảo toàn snapshot).
+6. `test/rbac-admin-audit.e2e-spec.ts` (14 tests — Bài 3.3 & 4.1): `RB1–RB4` (ma trận RBAC & hiệu lực tức thì), `AD1–AD4` (Admin APIs), `AU1–AU6` (Audit Subscriber/Interceptor & bất biến Q6–Q7).
+7. `test/limits-account-status.e2e-spec.ts` (13 tests — Bài 5.1 & 5.2): `L1–L7` (hạn mức lần/ngày giờ VN, nâng hạng `VIP`, 10 giao dịch đồng thời chạm trần ngày) và `A1–A6` (4 mã lỗi `FROZEN`/`CLOSED`, luật đóng tài khoản, số dư khả dụng `balance − hold_amount`, 3 `CHECK` constraints, Audit `ACCOUNT_UPDATED`, hoàn tiền khi `FROZEN`).
+8. `test/soft-delete-profile-history.e2e-spec.ts` (10 tests — Bài 3.4): `S1–S5` (xóa mềm user/account, thu hồi phiên `401`, giữ nguyên `counterpartyAccountNumber` trong lịch sử đối tác, giữ chỗ email `409`, rollback nguyên tử cùng Audit `USER_SOFT_DELETED`) và `H1–H5` (cập nhật hồ sơ, lưu vết `account_history`, đổi email cần `currentPassword`, trigger bất biến, bất biến Q8–Q10).
+
+### 6.3. Quy trình GitHub Actions CI (`.github/workflows/ci.yml`)
+File `.github/workflows/ci.yml` tự động hóa toàn bộ quy trình kiểm định (`backend-ci`: `lint` -> `build` -> `test:cov` -> `test:e2e` chạy 2 lần liên tiếp với PostgreSQL service container; `frontend-ci`: `lint` -> `build`). Bạn có thể chạy tương đương toàn bộ CI ngay trên máy cục bộ bằng chuỗi lệnh:
+```bash
+docker compose --profile test up -d postgres-test
+(cd backend && npm run lint && npm run build && npm run test:cov && npm run test:e2e && npm run test:e2e)
+(cd frontend && npm run lint && npm run build)
+```
 
 ## 7. Concurrency, Locking & Deadlock (Module 1)
 1. **Chống Lost Update / Âm quỹ (Bài 1.1 & 1.2):** Khóa dòng tài khoản bằng `SELECT ... FOR UPDATE OF "account"` kết hợp `UPDATE ... WHERE status = 'ACTIVE' AND deleted_at IS NULL AND (balance - hold_amount) >= :amount RETURNING balance` và `SET LOCAL lock_timeout = '5s'`.
@@ -221,11 +282,11 @@ WHERE r.type = 'REVERSAL' AND r.status = 'COMPLETED'
 "
 ```
 
-## 10. Cơ chế Chống Trùng Lặp Giao Dịch (`idempotency_keys`) & Frontend Auto-Retry (Module 2)
+## 10. Chống Trùng Lặp Giao Dịch (`idempotency_keys`) & Frontend Auto-Retry (Module 2)
 - Lưu khóa chống trùng trong bảng **`idempotency_keys`** (`UNIQUE (user_id, idempotency_key)`), kiểm tra `request_hash` (SHA-256), lưu bản chụp `response_status` & `response_body`, và tự động dọn khóa hết hạn (`TTL = 24 giờ`) mỗi giờ qua `@Cron(CronExpression.EVERY_HOUR)`.
 - Hàm dùng chung `submitIdempotentTransaction()` (`frontend/src/services/api.ts`) đặt `timeout = 10s`, tự động retry tối đa `MAX_RETRIES = 3` lần (`1s → 2s → 4s`) với **cùng `Idempotency-Key`** khi mất mạng/timeout hoặc nhận `202 Accepted`, kết hợp cờ `inFlightRef = useRef(false)`.
 
-## 11. Phân quyền theo Vai trò (RBAC) & Admin API (Module 4A — Bài 4.1)
+## 11. Phân quyền theo Vai trò (RBAC) & Admin API (Module 4A)
 
 | Endpoint | Không có Token | `CUSTOMER` (Active) | `ADMIN` (Active) | User bị `locked` / Xóa mềm |
 | :--- | :---: | :---: | :---: | :---: |
@@ -236,7 +297,7 @@ WHERE r.type = 'REVERSAL' AND r.status = 'COMPLETED'
 | `PATCH /api/admin/accounts/:accountNumber` | `401` | ❌ `403` | ✅ `200` | ❌ `403` / `401` |
 | `GET /api/admin/transactions`, `GET /api/admin/audit-logs` | `401` | ❌ `403` | ✅ `200` | ❌ `403` / `401` |
 
-## 12. Nhật ký Kiểm toán Tự động (`audit_logs` — Module 4A Bài 3.3)
+## 12. Nhật ký Kiểm toán Tự động (`audit_logs` — Module 4A)
 Bảng `audit_logs` (`id BIGSERIAL`, chỉ-ghi-thêm bằng Trigger `trg_audit_logs_immutable`) tự động ghi nhận:
 - Qua `UserAuditSubscriber` & `AccountAuditSubscriber` (cùng Database Transaction qua `event.manager`): `USER_STATUS_CHANGED`, `USER_UPDATED`, `USER_SOFT_DELETED`, `ACCOUNT_UPDATED`.
 - Qua `AuditInterceptor` + `@Audit()`: `AUTH_LOGIN_SUCCESS`, `AUTH_LOGIN_FAILED`, `TRANSACTION_REVERSED`.
@@ -254,7 +315,7 @@ WHERE action = 'USER_STATUS_CHANGED'
 "
 ```
 
-## 13. Hạn mức giao dịch, Trạng thái tài khoản & Số dư khả dụng (Module 5 — Bài 5.1 & 5.2)
+## 13. Hạn mức, Trạng thái tài khoản & Số dư khả dụng (Module 5 — Bài 5.1 & 5.2)
 
 ### 13.1. Bảng các ngưỡng Hạn mức theo Hạng tài khoản (`tier`)
 Hạn mức áp dụng cho các giao dịch làm tiền đi ra khỏi tài khoản nguồn (**`TRANSFER`** và **`WITHDRAW`**; miễn áp dụng cho `DEPOSIT` và `REVERSAL`), được kiểm tra ở **Bước 3 của Pha B dưới khóa dòng `SELECT ... FOR UPDATE`**:
@@ -305,7 +366,7 @@ Script seed (`npm run seed`) là **idempotent** (dùng `withDeleted: true`, khô
 - **Customer B (`CUSTOMER` / `active` / `VIP`):** `user2@bank.local` / `Password@123` — STK: `1000000002` — Số dư: `2,000,000.00 VND` (Hạn mức: `100M/lần`, `200M/ngày`).
 - **Customer C (`CUSTOMER` / `locked` / `STANDARD`):** `user3@bank.local` / `Password@123` — STK: `1000000003` — Số dư: `1,000,000.00 VND`.
 
-## 16. API Endpoints
+## 16. Danh mục API Endpoints
 | Method | Endpoint | Quyền hạn | Mô tả |
 | :--- | :--- | :---: | :--- |
 | `POST` | `/api/auth/register` | Public | Đăng ký người dùng mới (`CUSTOMER`, `STANDARD`, `ACTIVE`, `balance = 0.00`) |
@@ -328,13 +389,13 @@ Script seed (`npm run seed`) là **idempotent** (dùng `withDeleted: true`, khô
 | `GET` | `/api/admin/transactions` | Chỉ `ADMIN` | Xem toàn bộ giao dịch hệ thống (`fromAccountNumber`, `toAccountNumber`, lọc đa tiêu chí) |
 | `GET` | `/api/admin/audit-logs` | Chỉ `ADMIN` | Xem nhật ký kiểm toán hệ thống (phân trang, lọc `actorId`, `action`, `entity`, `entityId`, ngày) |
 
-## 17. Demo Scenario
+## 17. Demo Scenario Tổng hợp
 1. Chạy `docker compose up --build`, mở `http://localhost:3001`.
 2. Đăng nhập `user1@bank.local` / `Password@123` → Dashboard hiển thị STK `1000000001`, hạng `STANDARD`, trạng thái `ACTIVE`, Số dư khả dụng `5.000.000 VND`, và thanh tiến độ hạn mức ngày (`0 / 50.000.000 VND`).
-3. Mở **Nạp / Rút tiền** (`/cash`) và **Chuyển khoản** (`/transfer`): thử nạp tiền, chuyển nhiều khoản `9.900.000 VND` tới `1000000002` để thấy thanh hạn mức ngày tăng dần và từ chối ở khoản thứ 6 kèm thông báo nêu rõ số còn lại.
+3. Mở **Nạp / Rút tiền** (`/cash`) và **Chuyển khoản** (`/transfer`): nạp tiền, chuyển nhiều khoản `9.900.000 VND` tới `1000000002` để thấy thanh hạn mức ngày tăng dần và bị từ chối ở khoản thứ 6 kèm thông báo nêu rõ số còn lại.
 4. Mở **Hồ sơ** (`/profile`): cập nhật số điện thoại 2 lần liên tiếp và xem bảng **Lịch sử phiên bản hồ sơ đã lưu** hiển thị các phiên bản cũ `v2`, `v1`.
-5. Dùng `curl` với token `admin@bank.local` thử đóng băng tài khoản (`PATCH /api/admin/accounts/:accountNumber`), đặt `holdAmount`, và xóa mềm một user có số dư `0` (`DELETE /api/admin/users/:id`).
-6. Chạy 10 truy vấn bất biến Q1′–Q5 (Mục 9.3), Q6–Q7 (Mục 12), Q8–Q10 (Mục 14.3) và chạy `npm run test:e2e` (66 bài test) ở Mục 6.
+5. Dùng `curl` với token `admin@bank.local` thử đóng băng tài khoản (`PATCH /api/admin/accounts/:accountNumber`), đặt `holdAmount`, hoàn tiền một giao dịch (`POST /api/transactions/:id/reverse`), xóa mềm một user có số dư `0` (`DELETE /api/admin/users/:id`), và xem nhật ký tại `GET /api/admin/audit-logs`.
+6. Chạy 10 truy vấn bất biến Q1′–Q5 (Mục 9.3), Q6–Q7 (Mục 12), Q8–Q10 (Mục 14.3), chạy `npm run test:cov` và `npm run test:e2e` (Mục 6).
 
 ## 18. Troubleshooting & Known Limitations
 - **Giới hạn thời gian chờ khóa & Retry:** Các giao dịch chạm vào cùng một tài khoản xếp hàng chờ tối đa `LOCK_TIMEOUT = '5s'`, và tự động retry tối đa `MAX_DEADLOCK_RETRIES = 3` lần nếu gặp deadlock `40P01`.
@@ -344,27 +405,29 @@ Script seed (`npm run seed`) là **idempotent** (dùng `withDeleted: true`, khô
   - Chưa triển khai vai trò `TELLER`, nghiệp vụ giao dịch hộ khách tại quầy (`/staff/transactions/*`) và chưa làm giao diện Admin UI ở Frontend (sử dụng Swagger / `curl` với token `ADMIN`).
   - Trong khi `UserAuditSubscriber` và `AccountAuditSubscriber` ghi nhật ký trong cùng một Database Transaction với thao tác sửa dữ liệu, các sự kiện cấp HTTP do `AuditInterceptor` ghi nhận là best-effort.
 - **Giới hạn của Hạn mức, Trạng thái tài khoản, Số dư khả dụng & Xóa mềm (Module 5):**
-  - **Cấu hình hạn mức tĩnh:** Bảng hạn mức (`ACCOUNT_TIER_LIMITS` cho `STANDARD` và `VIP`) hiện là hằng số trong mã nguồn; việc thay đổi ngưỡng hạn mức yêu cầu triển khai lại ứng dụng (chưa tách ra bảng cấu hình động trong DB).
+  - **Cấu hình hạn mức tĩnh:** Bảng hạn mức (`ACCOUNT_TIER_LIMITS` cho `STANDARD` và `VIP`) hiện là hằng số trong mã nguồn; việc thay đổi ngưỡng hạn mức yêu cầu triển khai lại ứng dụng.
   - **Không hỗ trợ đa tiền tệ và thấu chi (Overdraft):** Mọi tài khoản đều dùng `VND` và bắt buộc `balance >= 0`, `hold_amount <= balance` (đa tiền tệ và thấu chi là `OUT OF SCOPE`).
-  - **Quản lý `hold_amount` thủ công bởi Admin:** Số tiền phong tỏa (`holdAmount`) hiện chỉ do `ADMIN` đặt/gỡ qua API quản trị, chưa có luồng tự động giải tỏa hold theo thời hạn.
+  - **Quản lý `hold_amount` thủ công bởi Admin:** Số tiền phong tỏa (`holdAmount`) hiện chỉ do `ADMIN` đặt/gỡ qua API quản trị.
   - **`usedToday` trên giao diện là thông tin gợi ý:** Khối `limits` trả về ở `GET /api/accounts/me` là kết quả đọc không khóa dùng để hiển thị thanh tiến độ và gợi ý trên UI; quyết định cho phép hay từ chối hạn mức luôn được thực hiện chính xác ở **Pha B dưới khóa dòng `FOR UPDATE`**.
-  - **Giữ chỗ email đã xóa mềm & Chưa có API Restore:** Cột `users.email` giữ ràng buộc `UNIQUE` toàn cục để bảo toàn định danh lịch sử, nên email của người dùng đã bị xóa mềm vẫn bị giữ chỗ (không thể đăng ký lại) và hiện chưa có API khôi phục (`restore`) người dùng đã xóa mềm.
+  - **Giữ chỗ email đã xóa mềm & Chưa có API Restore:** Cột `users.email` giữ ràng buộc `UNIQUE` toàn cục để bảo toàn định danh lịch sử, nên email của người dùng đã bị xóa mềm vẫn bị giữ chỗ (`409 Conflict` khi đăng ký lại) và hiện chưa có API khôi phục (`restore`).
   - **Chưa giới hạn số lần thử `currentPassword` khi đổi email:** Endpoint `PATCH /api/users/me` yêu cầu `currentPassword` khi thay đổi email nhưng hiện chưa áp dụng rate-limit riêng cho số lần nhập sai mật khẩu hiện tại.
 - **Giới hạn của Trigger bất biến trên `ledger_entries`, `audit_logs`, `account_history`:** Trigger mức dòng chặn `UPDATE`/`DELETE`, nhưng `superuser` vẫn có thể tắt trigger và `TRUNCATE` mức bảng không kích hoạt trigger mức dòng (dùng để dọn dữ liệu trên DB test).
 - **Giới hạn của các Job định kỳ (`@Cron`):** Các job `sweepStuckTransactions()` và `deleteExpiredKeys()` được thiết kế cho cấu hình **một instance backend**.
 
-## 19. Kế hoạch mở rộng (Trạng thái các Module Bổ sung)
+## 19. Ma trận Trạng thái các Module Bổ sung (`ĐÃ LÀM` & `HOÃN`)
+
+Chi tiết đối chiếu từng yêu cầu xem tại [`docs/traceability.md`](docs/traceability.md).
 
 | Bài tập bổ sung | Điểm gắn trong mã nguồn thực tế | Trạng thái |
 | :--- | :--- | :--- |
 | **1.1, 1.2, 1.3, 1.4** Race Condition, Locking & Deadlock | `transactions.service.ts` (`loadAccountsForTransaction`, `executeWithDeadlockRetry`), `scripts/concurrency/`, `docs/concurrency/` | ✅ **ĐÃ HOÀN THÀNH (Module 1)** |
-| **7.2** Concurrency Integration Tests | `backend/test/concurrency.e2e-spec.ts`, `backend/test/helpers/e2e-test.helper.ts` | ✅ **ĐÃ HOÀN THÀNH (Module 1)** |
+| **7.2** Concurrency Integration Tests | `backend/test/concurrency.e2e-spec.ts`, `.github/workflows/ci.yml` | ✅ **ĐÃ HOÀN THÀNH (Module 1 & 7)** |
 | **3.1** Sổ cái kép (`ledger_entries`) | `ledger-entry.entity.ts`, Migration `1710000002000`, `transactions.service.ts` (`insertLedgerEntries`), `seed.ts` | ✅ **ĐÃ HOÀN THÀNH (Module 3A)** |
-| **7.3** Test Rollback khi lỗi giữa chừng | `backend/test/ledger.e2e-spec.ts` (`L1–L3`, `R1–R2`), `assertLedgerInvariants()` | ✅ **ĐÃ HOÀN THÀNH (Module 3A)** |
+| **7.3** Test Rollback khi lỗi giữa chừng | `backend/test/ledger.e2e-spec.ts` (`L1–L3`, `R1–R2`), `assertLedgerInvariants()` | ✅ **ĐÃ HOÀN THÀNH (Module 3A & 7)** |
 | **3.2, 5.3** Transaction State Machine, `REVERSAL`, Ghi log `FAILED` & Quét treo | Migration `1710000003000`, `transactions.constants.ts`, `transactions.service.ts` (`transition`, 3 Pha, `reverseTransaction`, `sweepStuckTransactions`), `state-machine-reversal.e2e-spec.ts` | ✅ **ĐÃ HOÀN THÀNH (Module 3B)** |
 | **2.1, 2.2** Bảng `idempotency_keys`, Snapshot Replay, TTL 24h & Frontend Auto-Retry | Migration `1710000004000`, `idempotency-key.entity.ts`, `idempotency.service.ts`, `frontend/src/services/api.ts` (`submitIdempotentTransaction`), `idempotency.e2e-spec.ts` (`I1–I10`) | ✅ **ĐÃ HOÀN THÀNH (Module 2)** |
 | **3.3, 4.1 (cơ bản)** RBAC (`CUSTOMER`/`ADMIN`), Admin APIs & Audit Log tự động (`audit_logs`) | Migration `1710000005000`, `audit-log.entity.ts`, `request-context.ts`, `user-audit.subscriber.ts`, `audit.interceptor.ts`, `admin/`, `rbac-admin-audit.e2e-spec.ts` (`RB1–RB4`, `AD1–AD4`, `AU1–AU6`) | ✅ **ĐÃ HOÀN THÀNH (Module 4A rút gọn)** |
-| **4.1 (mở rộng)** Vai trò `TELLER`, `/staff/transactions/*` & Giao diện Admin UI | Mở rộng `UserRole`, `AdminModule` & Frontend | ⏸️ **HOÃN (`DEFERRED`)** |
 | **3.4, 5.1, 5.2** Hạn mức ngày, Trạng thái tài khoản (`FROZEN`/`CLOSED`), Số dư khả dụng & Xóa mềm + `account_history` | Migration `1710000006000`, `date.util.ts` (`calculateAccountLimits`), `account-audit.subscriber.ts`, `users/`, `limits-account-status.e2e-spec.ts` (`L1–L7`, `A1–A6`), `soft-delete-profile-history.e2e-spec.ts` (`S1–S5`, `H1–H5`) | ✅ **ĐÃ HOÀN THÀNH (Module 5)** |
-| **6.1, 6.2, 6.3** Đối soát tự động, Fraud Detection, Logging & Health | `@nestjs/schedule`, `ledger_entries`, `transactions.service.ts` | Sẵn sàng (Module 6) |
-| **7.1** Unit Test & Coverage | `TransactionsService`, `IdempotencyService`, `AdminService`, `UsersService`, `backend/test/` | Sẵn sàng (Module 7) |
+| **7.1** Unit Test, Độ phủ mã (`>= 80%`) & Chốt toàn dự án | `backend/jest.config.ts` (`coverageThreshold`), `src/test-utils/mock-helpers.ts`, 9 file `src/**/*.spec.ts`, `.github/workflows/ci.yml`, `docs/testing.md`, `docs/traceability.md`, `docs/defense-qa.md` | ✅ **ĐÃ HOÀN THÀNH (Module 7)** |
+| **4.1 (mở rộng), 4.2, 4.3, 4.4** Vai trò `TELLER`, Refresh Token, OTP giao dịch lớn & Rate Limiting | Ghi nhận trong `docs/traceability.md` | ⏸️ **HOÃN (`DEFERRED`)** |
+| **6.1, 6.2, 6.3** Cron job Đối soát tự động, Fraud Detection & Structured Logging / Health Check | Ghi nhận trong `docs/traceability.md` | ⏸️ **HOÃN (`DEFERRED`)** |
