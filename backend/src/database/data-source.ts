@@ -49,6 +49,12 @@ export const dataSourceOptions: DataSourceOptions = {
     AddLimitsAccountStatusSoftDeleteAndAccountHistory1710000006000,
   ],
   synchronize: false,
+  // Tăng kích thước pool kết nối để chịu tải cao khi 100 request đồng thời đi qua 3 Pha
+  extra: {
+    max: 30,
+    connectionTimeoutMillis: 10000,
+    idleTimeoutMillis: 30000,
+  },
 };
 
 const AppDataSource = new DataSource(dataSourceOptions);

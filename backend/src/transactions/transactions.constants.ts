@@ -10,7 +10,7 @@ import { TransactionStatus } from '../database/entities/transaction.entity';
 
 // Thời gian tối đa một transaction đứng chờ khóa dòng (SELECT ... FOR UPDATE)
 // Quá thời gian này PostgreSQL sẽ ném lỗi 55P03 (lock_not_available) -> API trả 503
-export const LOCK_TIMEOUT = '5s';
+export const LOCK_TIMEOUT = '15s';
 
 // Số lần tự động thử lại tối đa khi PostgreSQL phát hiện Deadlock (40P01)
 export const MAX_DEADLOCK_RETRIES = 3;
