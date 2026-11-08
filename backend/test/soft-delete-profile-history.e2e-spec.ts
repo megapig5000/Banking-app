@@ -370,8 +370,8 @@ describe('Module 5 (3.4) — Soft Delete & Versioned Profile History (e2e)', () 
 
     // 2. Giả lập lỗi giữa chừng khi xóa mềm user2 (sau khi đã đóng & xóa mềm Account, ném lỗi lúc xóa mềm User)
     const origSoftRemove = Object.getOwnPropertyDescriptor(
-        EntityManager.prototype,
-        'softRemove',
+      EntityManager.prototype,
+      'softRemove',
     )!.value as typeof EntityManager.prototype.softRemove;
     jest
       .spyOn(EntityManager.prototype, 'softRemove')
@@ -559,8 +559,8 @@ describe('Module 5 (3.4) — Soft Delete & Versioned Profile History (e2e)', () 
 
     // Giả lập lỗi ngay tại manager.save(User, user) sau khi insertProfileHistoryBeforeOverwrite đã chèn dòng vào account_history
     const origSave = Object.getOwnPropertyDescriptor(
-        EntityManager.prototype,
-        'save',
+      EntityManager.prototype,
+      'save',
     )!.value as typeof EntityManager.prototype.save;
     jest
       .spyOn(EntityManager.prototype, 'save')

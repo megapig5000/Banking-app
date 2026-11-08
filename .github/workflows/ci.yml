@@ -1,0 +1,133 @@
+name: Simple Banking App CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - "feat/**"
+  pull_request:
+    branches:
+      - main
+      - master
+      - "feat/**"
+
+env:
+  TZ: Asia/Ho_Chi_Minh
+
+jobs:
+  backend-ci:
+    name: Backend — Lint, Build, Unit Coverage (>=80%) & E2E (x2)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres-test:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: root
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: simple_bank_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd="pg_isready -U root -d simple_bank_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20 with npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm ci
+
+      - name: Prepare .env.test from .env.test.example
+        run: cp .env.test.example .env.test
+
+      - name: Run Backend Linter (oxlint type-aware)
+        run: npm run lint
+
+      - name: Build Backend (NestJS)
+        run: npm run build
+
+      - name: Run Unit Tests & Enforce Coverage Thresholds (>=80% on transactions & accounts)
+        run: npm run test:cov
+
+      - name: Run E2E Integration Tests — Pass #1 (66 tests including Concurrency 7.2 & Rollback 7.3)
+        env:
+          NODE_ENV: test
+          DB_HOST: localhost
+          DB_PORT: "5433"
+          DB_USER: root
+          DB_PASSWORD: password
+          DB_NAME: simple_bank_test
+          JWT_SECRET: test_secret_jwt_key_for_e2e
+          JWT_EXPIRES_IN: 1h
+          SEED_ON_START: "false"
+        run: npm run test:e2e
+
+      - name: Run E2E Integration Tests — Pass #2 (Verify non-flaky stability)
+        env:
+          NODE_ENV: test
+          DB_HOST: localhost
+          DB_PORT: "5433"
+          DB_USER: root
+          DB_PASSWORD: password
+          DB_NAME: simple_bank_test
+          JWT_SECRET: test_secret_jwt_key_for_e2e
+          JWT_EXPIRES_IN: 1h
+          SEED_ON_START: "false"
+        run: npm run test:e2e
+
+      - name: Upload Unit Test Coverage Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-unit-coverage-report
+          path: backend/coverage/
+          retention-days: 7
+
+  frontend-ci:
+    name: Frontend — Lint & Next.js Production Build
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20 with npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Prepare .env from .env.example
+        run: cp .env.example .env
+
+      - name: Run Frontend Linter (ESLint)
+        run: npm run lint
+
+      - name: Build Frontend (Next.js App Router)
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:3000/api
+        run: npm run build
